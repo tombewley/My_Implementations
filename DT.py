@@ -115,10 +115,12 @@ class DecisionTreeClassifier:
         """Use a text file containing Python-style if-then rules to define the tree structure."""
         
         self.feature_names = feature_names
+        self.num_features = len(feature_names)
+        self.num_samples_total = 1
         all_lines = [[w for w in l.strip().split(' ') if w != ''] for l in lines if l.strip() != '']
 
         def recurse(lines):
-            node = Node(None, None, None, None)
+            node = Node(0, 1, [1], None)
             line = lines.pop(0)
             if line[0] == 'if':
                 assert line[1] in feature_names 
@@ -130,7 +132,8 @@ class DecisionTreeClassifier:
                 assert lines[0] == ['else:']
                 lines.pop(0)
                 node.right, lines = recurse(lines)
-            elif line[0] == 'return':
+            else: 
+                assert line[0] == 'return'
                 try: node.predicted_class = int(line[1]) # Make predicted class an int if possible.
                 except: node.predicted_class = line[1]
             return node, lines
