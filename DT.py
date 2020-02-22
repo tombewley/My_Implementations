@@ -111,31 +111,68 @@ class DecisionTreeClassifier:
                 for l in lines: f.write(l+'\n')
 
 
-    def to_code(self, class_values=None, out_file=None): 
+    def from_code(self, lines, feature_names):
+        """Use a text file containing Python-style if-then rules to define the tree structure."""
+        
+        self.feature_names = feature_names
+        all_lines = [[w for w in l.strip().split(' ') if w != ''] for l in lines if l.strip() != '']
+
+        def recurse(lines):
+            node = Node(None, None, None, None)
+            line = lines.pop(0)
+            if line[0] == 'if':
+                assert line[1] in feature_names 
+                assert line[2] == '<='
+                assert ':' in line[3]
+                node.feature_index = feature_names.index(line[1])
+                node.threshold = float(line[3][:line[3].find(':')])
+                node.left, lines = recurse(lines)
+                assert lines[0] == ['else:']
+                lines.pop(0)
+                node.right, lines = recurse(lines)
+            elif line[0] == 'return':
+                try: node.predicted_class = int(line[1]) # Make predicted class an int if possible.
+                except: node.predicted_class = line[1]
+            return node, lines
+
+        self.tree_, _ = recurse(all_lines)
+
+
+    def to_code(self, comment=False, class_values=None, out_file=None): 
         """Print tree rules as an executable function definition.
         Adapted from https://stackoverflow.com/questions/20224526/how-to-extract-the-decision-rules-from-scikit-learn-decision-tree"""
 
         lines = []
-        lines.append("def tree({}):".format('ARGS'))#", ".join([f for f in self.feature_names])))
+        #lines.append("def tree({}):".format('ARGS'))#", ".join([f for f in self.feature_names])))
 
-        def recurse(node, depth=1):
+        def recurse(node, depth=0):
             indent = "    " * depth
-            counts = node.num_samples_per_class
             pred = node.predicted_class
-            conf = int(100 * (counts[pred] / np.sum(counts)))
-            weighted_impurity = node.impurity * node.num_samples / self.num_samples_total
+            if comment:
+                counts = node.num_samples_per_class
+                conf = int(100 * (counts[pred] / np.sum(counts)))
+                weighted_impurity = node.impurity * node.num_samples / self.num_samples_total
             if class_values != None: pred = class_values[pred]
             # Decision nodes.
             if node.feature_index != None:
                 feature = self.feature_names[node.feature_index]
                 threshold = node.threshold
-                lines.append("{}# depth = {}, best class = {}, confidence = {}%, counts = {}, weighted impurity = {}".format(indent, depth, pred, conf, counts.astype(int), weighted_impurity))
-                lines.append("{}if {} <= {}:".format(indent, feature, threshold))
+                if comment:
+                    lines.append("{}# depth = {}, best class = {}, confidence = {}%, counts = {}, weighted impurity = {}".format(indent, depth, pred, conf, counts.astype(int), weighted_impurity))
+                else:
+                    lines.append("{}if {} <= {}:".format(indent, feature, threshold))
                 recurse(node.left, depth+1)
-                lines.append("{}else: # if {} > {}".format(indent, feature, threshold))
+                if comment:
+                    lines.append("{}else: # if {} > {}".format(indent, feature, threshold))
+                else:
+                    lines.append("{}else:".format(indent))
                 recurse(node.right, depth+1)
             # Leaf nodes.
-            else: lines.append("{}return {} # confidence = {}%, counts = {}, weighted impurity = {}".format(indent, pred, conf, counts.astype(int), weighted_impurity))
+            else:
+                if comment: 
+                    lines.append("{}return {} # confidence = {}%, counts = {}, weighted impurity = {}".format(indent, pred, conf, counts.astype(int), weighted_impurity))
+                else: 
+                    lines.append("{}return {}".format(indent, pred))
 
         recurse(self.tree_)
 
@@ -145,6 +182,7 @@ class DecisionTreeClassifier:
         else: 
             with open(out_file+'.py', 'w', encoding='utf-8') as f:
                 for l in lines: f.write(l+'\n')
+
 
     def to_dataframe(self, out_file=None):
         """Represent the leaf notes of the tree as rows of a Pandas dataframe."""
