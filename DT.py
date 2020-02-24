@@ -73,17 +73,17 @@ class DecisionTreeClassifier:
         self.potential_feature_importances_ /= sum(self.potential_feature_importances_)
 
 
-    def predict(self, X, explain=False):
+    def predict(self, X, extra=None):
         """Predict class for X."""
         shp = np.shape(X)
-        if len(shp)==1 or np.shape(X)[1]==1: return self._predict(X, explain)
-        else: return [self._predict(inputs, explain) for inputs in X]
+        if len(shp)==1 or np.shape(X)[1]==1: return self._predict(X, extra)
+        else: return [self._predict(inputs, extra) for inputs in X]
 
 
     def score(self, X, y):
         """Score classification performance on a dataset."""
         X, y = np.array(X), np.array(y)
-        correct = [self._predict(inputs, False) for inputs in X] == y
+        correct = [self._predict(inputs, None) for inputs in X] == y
         return sum(correct) / y.size
 
 
@@ -197,7 +197,8 @@ class DecisionTreeClassifier:
                 recurse(node.right, depth+1, path+[1], partitions+[(node.feature_index, '>', node.threshold)])
             # Leaf nodes.
             else:
-                row = [depth]
+                leaf_uid = int(''.join(['1'] + [str(n) for n in path]), 2) # <--- IMPORTANT TO ADD AN EXTRA 1 AT THE START SO THAT 0s DON'T GET CHOPPED OFF.
+                row = [leaf_uid, depth]
                 for f in range(self.num_features):
                     for sign in ['>','<']:
                         p_rel = [p for p in partitions if p[0] == f and p[1] == sign]
@@ -213,7 +214,7 @@ class DecisionTreeClassifier:
                 row += [counts, pred, prob, conf, node.impurity, weighted_impurity]
                 data.append(row)
         recurse(self.tree_)
-        df = pd.DataFrame(data,columns=['depth'] + [f+sign for f in self.feature_names for sign in [' >',' <']] + ['counts','class','prob','conf','impurity','weighted impurity'])
+        df = pd.DataFrame(data,columns=['uid','depth'] + [f+sign for f in self.feature_names for sign in [' >',' <']] + ['counts','class','prob','conf','impurity','weighted impurity']).set_index('uid')
         
         # If no out file specified, just return.
         if out_file == None: return df
@@ -413,17 +414,18 @@ class DecisionTreeClassifier:
         return node
 
 
-    def _predict(self, inputs, explain):
+    def _predict(self, inputs, extra):
         """Predict class for a single sample, optionally returning the decision path or explanation."""
         node = self.tree_
-        if explain: path = []
+        if extra: path = []
         while node.left:
             if inputs[node.feature_index] < node.threshold: child = node.left; lr = 0
             else: child = node.right; lr = 1
-            if explain and node.feature_index != None: path.append((node.feature_index, node.threshold, lr))
+            if extra and node.feature_index != None: path.append((node.feature_index, node.threshold, lr))
             node = child
         # Return prediction alongside decision path and factual explanation.
-        if explain: return node.predicted_class, path, self._path_to_explanation(path)
+        if extra == 'explain': return node.predicted_class, path, self._path_to_explanation(path)
+        elif extra == 'leaf_uid': return node.predicted_class, int(''.join(['1'] + [str(n[2]) for n in path]), 2) # <--- IMPORTANT TO ADD AN EXTRA 1 AT THE START SO THAT 0s DON'T GET CHOPPED OFF.
         # Just return prediction.
         return node.predicted_class
 
