@@ -124,7 +124,7 @@ class DecisionTreeClassifier:
             line = lines.pop(0)
             if line[0] == 'if':
                 assert line[1] in feature_names 
-                assert line[2] == '<='
+                assert line[2] == '<'
                 assert ':' in line[3]
                 node.feature_index = feature_names.index(line[1])
                 node.threshold = float(line[3][:line[3].find(':')])
@@ -163,10 +163,10 @@ class DecisionTreeClassifier:
                 if comment:
                     lines.append("{}# depth = {}, best class = {}, confidence = {}%, counts = {}, weighted impurity = {}".format(indent, depth, pred, conf, counts.astype(int), weighted_impurity))
                 else:
-                    lines.append("{}if {} <= {}:".format(indent, feature, threshold))
+                    lines.append("{}if {} < {}:".format(indent, feature, threshold))
                 recurse(node.left, depth+1)
                 if comment:
-                    lines.append("{}else: # if {} > {}".format(indent, feature, threshold))
+                    lines.append("{}else: # if {} >= {}".format(indent, feature, threshold))
                 else:
                     lines.append("{}else:".format(indent))
                 recurse(node.right, depth+1)
