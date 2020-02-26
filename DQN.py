@@ -65,20 +65,20 @@ class Agent():
 
         # Create q network
         self.s, self.q_values, q_network = self.build_network()
-        q_network_weights = q_network.trainable_weights
+        self.q_network_weights = q_network.trainable_weights
 
         # Create target network
         self.st, self.target_q_values, target_network = self.build_network()
         target_network_weights = target_network.trainable_weights
 
         # Define target network update operation
-        self.update_target_network = [target_network_weights[i].assign(q_network_weights[i]) for i in range(len(target_network_weights))]
+        self.update_target_network = [target_network_weights[i].assign(self.q_network_weights[i]) for i in range(len(target_network_weights))]
 
         # Define loss and gradient update operation
-        self.a, self.y, self.loss, self.grads_update = self.build_training_op(q_network_weights)
+        self.a, self.y, self.loss, self.grads_update = self.build_training_op()
 
         self.sess = tf.InteractiveSession()
-        self.saver = tf.train.Saver(q_network_weights)
+        self.saver = tf.train.Saver(self.q_network_weights)
         self.summary_placeholders, self.update_ops, self.summary_op = self.setup_summary()
         self.summary_writer = tf.summary.FileWriter(self.env_name+'/summary', self.sess.graph)
 
@@ -109,7 +109,7 @@ class Agent():
         return s, q_values, model
 
 
-    def build_training_op(self, q_network_weights):
+    def build_training_op(self):
         a = tf.placeholder(tf.int64, [None])
         y = tf.placeholder(tf.float32, [None])
 
@@ -124,7 +124,7 @@ class Agent():
         loss = tf.reduce_mean(0.5 * tf.square(quadratic_part) + linear_part)
 
         optimizer = tf.train.RMSPropOptimizer(self.learning_rate, momentum=self.momentum, epsilon=self.min_grad)
-        grads_update = optimizer.minimize(loss, var_list=q_network_weights)
+        grads_update = optimizer.minimize(loss, var_list=self.q_network_weights)
 
         return a, y, loss, grads_update
 
