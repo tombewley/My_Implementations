@@ -29,10 +29,10 @@ class DecisionTreeClassifier:
 
     def class_loss_to_matrix(self):
         # If unspecified, use 1 - Identity matrix.
-        if self.pw_class_loss == None: self._pwl = 1 - np.identity(self.n_classes_)
+        if self.pw_class_loss == None: self._pwl = 1 - np.identity(self.n_classes)
         # Otherwise use values provided.
         else:
-            self._pwl = np.zeros((self.n_classes_,self.n_classes_))
+            self._pwl = np.zeros((self.n_classes,self.n_classes))
             for c,losses in self.pw_class_loss.items():
                 for cc,l in losses.items():
                     # *** Must be symmetric! ***
@@ -49,7 +49,7 @@ class DecisionTreeClassifier:
         self.num_samples_total, self.num_features = X.shape
         self.feature_names = feature_names
         self.class_index = {c:i for i,c in enumerate(sorted(list(set(y))))} # Alphanumeric order.
-        self.n_classes_ = len(self.class_index)
+        self.n_classes = len(self.class_index)
         X, y = np.array(X), np.array([self.class_index[c] for c in y]) # Convert class representation into indices.
 
         # Set up min samples for split / leaf if these were specified as ratios.
@@ -100,9 +100,11 @@ class DecisionTreeClassifier:
         return path, self._path_to_explanation(path)
 
 
-    def debug(self, class_values=None, show_details=True, out_file=None):
+    def debug(self, better_feature_names=None, class_values=None, show_details=True, out_file=None):
         """Create ASCII visualization of decision tree."""
-        lines = self.tree_.debug(self.feature_names, class_values, show_details)
+        if better_feature_names:    feature_names = [better_feature_names[f] for f in self.feature_names]
+        else:                       feature_names = self.feature_names
+        lines = self.tree_.debug(feature_names, class_values, show_details)
         # If no out file specified, just print.
         if out_file == None: 
            for line in lines: print(line)
@@ -206,15 +208,16 @@ class DecisionTreeClassifier:
                         if len(p_rel) > 0: val = p_rel[-1][2]
                         else: val = (np.inf if sign == '<' else -np.inf)  
                         row.append(val)
+                num_samples = node.num_samples
                 counts = node.num_samples_per_class
                 pred = node.predicted_class
-                prob =  node.num_samples / self.num_samples_total
-                conf = max(counts) / sum(counts)
+                prob =  num_samples / self.num_samples_total
+                conf = max(counts) / num_samples
                 weighted_impurity = node.impurity * prob
-                row += [counts, pred, prob, conf, node.impurity, weighted_impurity]
+                row += [num_samples, counts, pred, prob, conf, node.impurity, weighted_impurity]
                 data.append(row)
         recurse(self.tree_)
-        df = pd.DataFrame(data,columns=['uid','depth'] + [f+sign for f in self.feature_names for sign in [' >',' <']] + ['counts','class','prob','conf','impurity','weighted impurity']).set_index('uid')
+        df = pd.DataFrame(data,columns=['uid','depth'] + [f+sign for f in self.feature_names for sign in [' >',' <']] + ['num_samples','counts','class','prob','conf','impurity','weighted impurity']).set_index('uid')
         
         # If no out file specified, just return.
         if out_file == None: return df
@@ -335,7 +338,7 @@ class DecisionTreeClassifier:
             thresholds, classes = zip(*sorted(zip(X[:, idx], y)))
 
             # Loop through all possible split positions for this feature.
-            num_left = np.array([0 for c in range(self.n_classes_)],dtype=np.int64)
+            num_left = np.array([0 for c in range(self.n_classes)],dtype=np.int64)
             impurity_sum_left = 0.
             num_right = num_parent.copy()
             impurity_sum_right = self._impurity_sum(num_right)
@@ -369,7 +372,7 @@ class DecisionTreeClassifier:
         """Build a decision tree by recursively finding the best split."""
         # Population for each class in current node. The predicted class is the one with largest population.
         N = y.size
-        num_samples_per_class = np.array([np.sum(y == c) for c in range(self.n_classes_)],dtype=np.int64)
+        num_samples_per_class = np.array([np.sum(y == c) for c in range(self.n_classes)],dtype=np.int64)
         impurity = self._impurity_sum(num_samples_per_class) / (N**2)
         #impurity = self._impurity(num_samples_per_class, N)
         # Get modal class number and convert back into class label.
