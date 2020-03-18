@@ -98,9 +98,9 @@ class Agent():
 
     def build_network(self):
         model = Sequential()
-        model.add(Dense(self.hidden_topology[0], activation='relu', kernel_initializer=tf.keras.initializers.VarianceScaling(scale=2.), input_shape=(self.num_features,)))
+        model.add(Dense(self.hidden_topology[0], activation='relu', input_shape=(self.num_features,)))#, kernel_initializer=tf.keras.initializers.VarianceScaling(scale=2.), ))
         for num_units in self.hidden_topology[1:]:
-            model.add(Dense(num_units, activation='relu', kernel_initializer=tf.keras.initializers.VarianceScaling(scale=2.)))
+            model.add(Dense(num_units, activation='relu'))#, kernel_initializer=tf.keras.initializers.VarianceScaling(scale=2.)))
         model.add(Dense(self.num_actions))
 
         s = tf.placeholder(tf.float32, [None, self.num_features])
@@ -124,6 +124,7 @@ class Agent():
         loss = tf.reduce_mean(0.5 * tf.square(quadratic_part) + linear_part)
 
         optimizer = tf.train.RMSPropOptimizer(self.learning_rate, momentum=self.momentum, epsilon=self.min_grad)
+        #optimizer = tf.train.AdamOptimizer()
         grads_update = optimizer.minimize(loss, var_list=self.q_network_weights)
 
         return a, y, loss, grads_update
@@ -254,7 +255,6 @@ class Agent():
 
     def load_network(self):
         checkpoint = tf.train.get_checkpoint_state(self.save_network_path)
-        print(checkpoint.model_checkpoint_path)
         if checkpoint and checkpoint.model_checkpoint_path:
             self.saver.restore(self.sess, checkpoint.model_checkpoint_path)
             print('Successfully loaded: ' + checkpoint.model_checkpoint_path)

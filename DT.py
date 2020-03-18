@@ -119,7 +119,7 @@ class DecisionTreeClassifier:
         self.feature_names = feature_names
         self.num_features = len(feature_names)
         self.num_samples_total = 1
-        all_lines = [[w for w in l.strip().split(' ') if w != ''] for l in lines if l.strip() != '']
+        classes = set()
 
         def recurse(lines):
             node = Node(0, 1, [1], None)
@@ -138,9 +138,13 @@ class DecisionTreeClassifier:
                 assert line[0] == 'return'
                 try: node.predicted_class = int(line[1]) # Make predicted class an int if possible.
                 except: node.predicted_class = line[1]
+                classes.add(node.predicted_class)
             return node, lines
 
+        all_lines = [[w for w in l.strip().split(' ') if w != ''] for l in lines if l.strip() != '']
         self.tree_, _ = recurse(all_lines)
+        self.class_index = {c:i for i,c in enumerate(sorted(classes))} # Alphanumeric order.
+        self.n_classes = len(self.class_index)
 
 
     def to_code(self, comment=False, class_values=None, out_file=None): 
@@ -473,7 +477,7 @@ class Node:
             else: lines = [str(self.predicted_class)]
         else:
             lines = [
-                "{} < {:.5f}".format(feature_names[self.feature_index], self.threshold)
+                "{},{:.2f}".format(feature_names[self.feature_index], self.threshold)
             ]
         if show_details:
             lines += [
