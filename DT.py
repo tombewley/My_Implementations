@@ -450,8 +450,6 @@ class DecisionTreeClassifier:
 
 
 class Node:
-    """A decision tree node."""
-
     def __init__(self, impurity, num_samples, num_samples_per_class, predicted_class):
         self.impurity = impurity
         self.num_samples = num_samples

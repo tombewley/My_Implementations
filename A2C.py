@@ -19,7 +19,7 @@ class ProbabilityDistribution(tf.keras.Model):
 # ------------------------------------------------------------
 
 class Model(tf.keras.Model):
-    def __init__(self, num_actions):
+    def __init__(self, input_shape, num_actions):
         # Inherits from keras.Model. Initialise with the argument 'mlp_policy'.
         super().__init__('mlp_policy')
         # Define network structure.
@@ -29,6 +29,9 @@ class Model(tf.keras.Model):
         # Logits are unnormalized log probabilities.
         self.logits = kl.Dense(num_actions, name='policy_logits')
         self.dist = ProbabilityDistribution()
+        # Build.
+        self.in_shape = input_shape
+        self.build(input_shape=input_shape)
 
 
     def call(self, inputs, **kwargs):
@@ -40,6 +43,30 @@ class Model(tf.keras.Model):
         return self.logits(hidden_logs), self.value(hidden_vals)
 
 
+    # def __init__(self, input_shape, num_actions):
+    #     # Inherits from keras.Model. Initialise with the argument 'mlp_policy'.
+    #     super().__init__('mlp_policy')
+
+    #     # Define network structures.
+    #     self.actor = tf.keras.models.Sequential()
+    #     self.actor.add(kl.Dense(128, activation='relu'))
+    #     self.actor.add(kl.Dense(num_actions, name='policy_logits'))
+    #     self.critic = tf.keras.models.Sequential()
+    #     self.critic.add(kl.Dense(128, activation='relu'))
+    #     self.critic.add(kl.Dense(1, name='value'))
+
+    #     self.dist = ProbabilityDistribution()
+
+    #     self.in_shape = input_shape
+    #     self.build(input_shape=input_shape)
+
+
+    # def call(self, inputs, **kwargs):
+    #     # Inputs is a numpy array, convert to a tensor.
+    #     x = tf.convert_to_tensor(inputs)
+    #     return self.actor(x), self.critic(x)
+
+
     def action_value(self, obs):
         # Executes `call()` under the hood.
         logits, value = self.predict_on_batch(obs)
@@ -49,21 +76,22 @@ class Model(tf.keras.Model):
 # ------------------------------------------------------------
 
 class Agent:
-    def __init__(self, obs_space_shape, act_space_shape, gamma=0.99, batch_size=64, lr=7e-3, value_c=0.5, entropy_c=1e-4):
+    def __init__(self, model, learning_rate=7e-3, gamma=0.99, batch_size=64, value_c=0.5, entropy_c=1e-4):
+        self.model = model
         self.gamma = gamma
         self.batch_size = batch_size
         self.value_c = value_c # Coefficients are used for the loss terms.
         self.entropy_c = entropy_c
 
-        self.model = Model(num_actions=act_space_shape)
-        self.model.compile(optimizer=ko.RMSprop(lr=lr),
-                           # Define separate losses for policy logits and value estimate.
-                           loss=[self._logits_loss, self._value_loss])
+        # Define optimiser and losses used to train the model.
+        self.model.compile(    optimizer=ko.RMSprop(lr=learning_rate),
+                               #optimizer=ko.Adam(learning_rate=learning_rate, beta_1=0.9, beta_2=0.999, amsgrad=False),
+                               loss=[self._logits_loss, self._value_loss])
 
         # Structures for storing data used during training.
         self.actions = np.empty((batch_size,), dtype=np.int32)
         self.rewards, self.dones, self.values = np.empty((3, batch_size))
-        self.observations = np.empty((batch_size,) + obs_space_shape)
+        self.observations = np.empty((batch_size,) + self.model.in_shape)   
         self.ep_rewards = [0.0]
         self.t = 0 # Total timesteps seen.
         self.i = 0 # Counter used to determine when to train (batch size reached).  
