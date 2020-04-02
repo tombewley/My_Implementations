@@ -10,8 +10,9 @@ Some details also taken from: Silva, A., et al. "Optimization Methods for Interp
                               Frosst, N., and G. Hinton. "Distilling a Neural Network Into a Soft Decision Tree". 
                               ArXiv:1711.09784 [Cs, Stat], 27 November 2017. http://arxiv.org/abs/1711.09784.
 
+TODO: Bound per-leaf predictions to range of dataset.
+
 TODO: Classification mode from Frosst and Hinton.
-TODO: Initialisation function.
 
 """
 
@@ -48,7 +49,6 @@ class DifferentiableDecisionTree:
         def recurse(depth_remaining):
             node = Node()
             if depth_remaining == 0: 
-                node.isleaf = True
                 node._init_leaf(self.output_size, sd_y=0.01)
                 self.leaves.append(node)
             else:
@@ -60,9 +60,12 @@ class DifferentiableDecisionTree:
         self.tree = recurse(self.depth)
 
     
-    def initialise(self, X, T):
-        """Initialise node parameters using the statistics of X and T. NOT YET IMPLEMENTED."""
-        return
+    def initialise_leaves(self, T):
+        """Initialise per-leaf predictions using the min/max values of T."""
+        min_T = np.min(T, axis=0)
+        max_T = np.max(T, axis=0)
+        for leaf in self.leaves:
+            leaf.y = np.random.uniform(min_T, max_T)
 
     
     def train_on_batch(self, X, T):

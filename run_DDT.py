@@ -4,32 +4,40 @@ import numpy as np
 import matplotlib.pyplot as plt
 from joblib import dump
     
-input_size = 1
-output_size = 1
-num_instances = 100   
+
+num_instances = 500   
 depth = 3
 
-dt = DifferentiableDecisionTree(depth=depth, input_size=input_size, output_size=output_size, lr_y=1, lr_w=1)
 
-_, ax = plt.subplots(); plt.ion(); plt.show()
 
-X = np.random.rand() + np.sort(np.random.rand(num_instances, input_size), axis=0) #np.random.rand() 
-T = np.sin(16*X)+ 0.5*np.random.rand(np.shape(X)[0],np.shape(X)[1])
+#X = -np.random.rand() + np.sort(np.random.rand(num_instances, input_size), axis=0) #np.random.rand() 
+#T = X**2 + 0.1*np.random.rand(np.shape(X)[0],np.shape(X)[1])
 
-ax.scatter(X, T, color='k', s=1)
+# 2 dimensional.
+X = np.array([np.random.uniform([-5,-5],[5,5]) for _ in range(num_instances)])
+#T = np.sin(X[:,0] + X[:,1]).reshape(-1,1)
+T = np.sqrt(X[:,0]**2 + X[:,1]**2).reshape(-1,1)
 
-for i in range(20000):
+dt = DifferentiableDecisionTree(depth=depth, input_size=np.shape(X)[1], output_size=np.shape(T)[1], lr_y=0.5, lr_w=0.5)
 
-    #idx = np.random.randint(len(X), size=64)
+# #dt.initialise_leaves(T)
 
-    dt.train_on_batch(X,T)#X[idx,:], T[idx,:])
-    Y = dt.predict(X)
-    ax.plot(X, Y, color='g')
+# _, ax = plt.subplots(); plt.ion(); plt.show()
+# ax.scatter(X, T, color='k', s=1)
+
+for i in range(5000):
+
+    dt.train_on_batch(X,T)
+    Y, mus, _ = dt.predict(X, composition=True)
     mean_E = np.abs(T - Y).mean()
     print(i, mean_E)
-    plt.pause(0.0001)
-    l = ax.lines.pop(-1); del l
+    #print([leaf.y for leaf in dt.leaves])
+    #print(mus[0], Y[0])
+    #print(mus[-1], Y[-1])
+    #ax.plot(X, Y, color='g')
+    #plt.pause(0.0001)
+    #l = ax.lines.pop(-1); del l
 
-dump(dt, 'sin(16x).joblib')
+dump(dt, 'sqrt(X[0]**2 + X[1]**2).joblib')
 
-plt.ioff(); plt.show()
+# plt.ioff(); plt.show()

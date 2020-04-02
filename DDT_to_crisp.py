@@ -4,20 +4,42 @@ import numpy as np
 import matplotlib.pyplot as plt
 from joblib import load
 
-dt = load('sin(16x).joblib')
+dt = load('sin(X[0] + X[1]).joblib')
 
-Y, mus, ys = dt.predict([1], composition=True)
+#Y, mus, ys = dt.predict([1], composition=True)
 
 """
 Seems to be producing leaves whose values are way outside the distribution of the data, 
 but 'cancel each other out' - this isn't a great way of solving the problem, and makes it hard to make crisp.
 """
 
-print(Y)
-print(mus)
-print(ys)
+# fig = plt.figure()
+# ax = fig.gca(projection='3d')
 
-# X = np.arange(0,2,0.02).reshape(-1,1)
-# Y = dt.predict(X)
-# plt.plot(X, Y)
+# # Make data.
+# X = np.arange(-5, 5, 0.25)
+# Y = np.arange(-5, 5, 0.25)
+# X, Y = np.meshgrid(X, Y)
+# Z = np.zeros_like(X)
+
+# for i in range(np.shape(X)[0]):
+#     for j in range(np.shape(X)[1]):
+#         Z[i,j] = dt.predict([X[i,j],Y[i,j]])[0,0]
+
+# ax.plot_surface(X, Y, Z)
+
 # plt.show()
+
+fig = plt.figure()
+ax = fig.gca(projection='3d')
+
+# Make data.
+X = np.arange(-5, 5, 0.25)
+Y = np.arange(-5, 5, 0.25)
+X, Y = np.meshgrid(X, Y)
+Z = np.sqrt(X**2 + Y**2)
+
+# Plot the surface.
+surf = ax.plot_surface(X, Y, Z)
+
+plt.show()
