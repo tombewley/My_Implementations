@@ -1,43 +1,60 @@
 from my.DDT import DifferentiableDecisionTree
 
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
 from joblib import dump
-    
+import matplotlib.pyplot as plt
 
-num_instances = 500   
-depth = 3
+FNAME = 'hf_hf_nobalance_band'
 
+DEPTH = 3
+W_INIT_SD = 0.1
+NUM_UPDATES = 10000
+BATCH_SIZE = 64
+LR_Y = 0.05 # Larger tree = higher learning rate.
+LR_W = 0.01
 
+# --------------------------------------------
 
-#X = -np.random.rand() + np.sort(np.random.rand(num_instances, input_size), axis=0) #np.random.rand() 
-#T = X**2 + 0.1*np.random.rand(np.shape(X)[0],np.shape(X)[1])
+df = pd.read_csv('{}.csv'.format(FNAME))
+X = np.array(df[['speed','me_to_junc','me_to_inf','x1_vs_me','inf_rel_speed','x1_rel_speed']])
+T = np.array(df['acc_label']).reshape(-1,1)
 
-# 2 dimensional.
-X = np.array([np.random.uniform([-5,-5],[5,5]) for _ in range(num_instances)])
-#T = np.sin(X[:,0] + X[:,1]).reshape(-1,1)
-T = np.sqrt(X[:,0]**2 + X[:,1]**2).reshape(-1,1)
+print(np.shape(X), np.shape(T))
 
-dt = DifferentiableDecisionTree(depth=depth, input_size=np.shape(X)[1], output_size=np.shape(T)[1], lr_y=0.5, lr_w=0.5)
+# # 2 dimensional.
+# # X = np.array([np.random.uniform([-5,-5],[5,5]) for _ in range(num_instances)])
+# # T = np.sqrt(X[:,0]**2 + X[:,1]**2).reshape(-1,1)
 
-# #dt.initialise_leaves(T)
+ddt = DifferentiableDecisionTree(depth = DEPTH, 
+                                input_size = np.shape(X)[1], 
+                                output_size = np.shape(T)[1], 
+                                lr_y = LR_Y, 
+                                lr_w = LR_W, 
+                                y_lims = (np.min(T, axis=0), np.max(T, axis=0)),
+                                )
 
-# _, ax = plt.subplots(); plt.ion(); plt.show()
-# ax.scatter(X, T, color='k', s=1)
+fig, ax = plt.subplots()
+plt.ion(); plt.show()
 
-for i in range(5000):
+mae_ma_last = np.inf
+mae = [np.inf] * 100
+for i in range(NUM_UPDATES):
+    # Perform gradient update on a batch.
+    idx = np.random.randint(np.shape(X)[0], size=BATCH_SIZE) 
+    X_batch = X[idx,:]; T_batch = T[idx,:]
+    ddt.update_step(X_batch, T_batch)
+    # Compute mean absolute error after update.
+    mae[i % 100] = np.abs(T_batch - ddt.predict(X_batch)).mean()
 
-    dt.train_on_batch(X,T)
-    Y, mus, _ = dt.predict(X, composition=True)
-    mean_E = np.abs(T - Y).mean()
-    print(i, mean_E)
-    #print([leaf.y for leaf in dt.leaves])
-    #print(mus[0], Y[0])
-    #print(mus[-1], Y[-1])
-    #ax.plot(X, Y, color='g')
-    #plt.pause(0.0001)
-    #l = ax.lines.pop(-1); del l
+    if i % 10 == 0: 
+        mae_ma = np.mean(mae)
+        ax.plot([i-10, i], [mae_ma_last, mae_ma], 'k')
+        plt.pause(0.001)
+        mae_ma_last = mae_ma
+    print(i, mae_ma)
+    print([round(leaf.y[0], 2) for leaf in ddt.leaves])
 
-dump(dt, 'sqrt(X[0]**2 + X[1]**2).joblib')
+    #if mae < 0.2: break
 
-# plt.ioff(); plt.show()
+dump(ddt, '{}_D={}_{}.joblib'.format(FNAME, DEPTH, round(mae_ma,2)))

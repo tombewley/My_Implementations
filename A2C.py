@@ -19,17 +19,20 @@ class ProbabilityDistribution(tf.keras.Model):
 # ------------------------------------------------------------
 
 class Model(tf.keras.Model):
-    def __init__(self, input_shape, num_actions):
+    def __init__(self, input_shape, hidden_topology, num_actions):
         # Inherits from keras.Model. Initialise with the argument 'mlp_policy'.
         super().__init__('mlp_policy')
-        # Define network structure.
-        self.hidden1 = kl.Dense(128, activation='relu')
-        self.hidden2 = kl.Dense(128, activation='relu')
-        self.value = kl.Dense(1, name='value')
-        # Logits are unnormalized log probabilities.
+        # Define hidden network structures. Same for actor and critic.
+        self.actor_hidden = []; self.critic_hidden = []
+        self.num_hidden_layers = len(hidden_topology)
+        for s in hidden_topology: 
+            self.actor_hidden.append(kl.Dense(s, activation='relu'))
+            self.critic_hidden.append(kl.Dense(s, activation='relu'))
+        # Define final output layers (logits for actor, value for critic).
         self.logits = kl.Dense(num_actions, name='policy_logits')
         self.dist = ProbabilityDistribution()
-        # Build.
+        self.value = kl.Dense(1, name='value')
+        # Build the model.
         self.in_shape = input_shape
         self.build(input_shape=input_shape)
 
@@ -38,33 +41,11 @@ class Model(tf.keras.Model):
         # Inputs is a numpy array, convert to a tensor.
         x = tf.convert_to_tensor(inputs)
         # Separate hidden layers from the same input tensor.
-        hidden_logs = self.hidden1(x)
-        hidden_vals = self.hidden2(x)
-        return self.logits(hidden_logs), self.value(hidden_vals)
-
-
-    # def __init__(self, input_shape, num_actions):
-    #     # Inherits from keras.Model. Initialise with the argument 'mlp_policy'.
-    #     super().__init__('mlp_policy')
-
-    #     # Define network structures.
-    #     self.actor = tf.keras.models.Sequential()
-    #     self.actor.add(kl.Dense(128, activation='relu'))
-    #     self.actor.add(kl.Dense(num_actions, name='policy_logits'))
-    #     self.critic = tf.keras.models.Sequential()
-    #     self.critic.add(kl.Dense(128, activation='relu'))
-    #     self.critic.add(kl.Dense(1, name='value'))
-
-    #     self.dist = ProbabilityDistribution()
-
-    #     self.in_shape = input_shape
-    #     self.build(input_shape=input_shape)
-
-
-    # def call(self, inputs, **kwargs):
-    #     # Inputs is a numpy array, convert to a tensor.
-    #     x = tf.convert_to_tensor(inputs)
-    #     return self.actor(x), self.critic(x)
+        h_actor = x; h_critic = x
+        for i in range(self.num_hidden_layers):
+            h_actor = self.actor_hidden[i](h_actor)
+            h_critic = self.critic_hidden[i](h_critic)
+        return self.logits(h_actor), self.value(h_critic)
 
 
     def action_value(self, obs):

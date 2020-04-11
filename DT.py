@@ -87,17 +87,19 @@ class DecisionTreeClassifier:
         return sum(correct) / y.size
 
 
-    def leaf_path(self, leaf_uid):
-        """Given a leaf UID (integer encoding of binary string representing leaf/right decisions)
-        Return the path and factual explanation for that leaf."""
-        node = self.tree_; path = []
-        for lr in str(bin(leaf_uid))[3:]: # Chop off 0b as well as leading 1.
+    def get_node_info(self, path=None, uid=None):
+        """Given a path (binary string representing left/right decisions) or UID (integer encoding of path),
+        return the path and factual explanation for that node, 
+        as well as the feature and threshold tested (if decision node) and the predicted class."""
+        if not path: path = str(bin(uid))[3:]
+        node = self.tree_; tests = []
+        for lr in path: # Chop off 0b as well as leading 1.
             lr = int(lr)
             if lr == 0: child = node.left; 
             else: child = node.right
-            path.append((node.feature_index, node.threshold, lr))
+            tests.append((node.feature_index, node.threshold, lr))
             node = child
-        return path, self._path_to_explanation(path)
+        return tests, self._tests_to_explanation(tests), node
 
 
     def debug(self, better_feature_names=None, class_values=None, show_details=True, out_file=None):
@@ -274,7 +276,7 @@ class DecisionTreeClassifier:
                 right_leaves_weighted_impurity, right_num_leaves = recurse_compute_cost(node.right, path_to_here+[1])
                 leaves_weighted_impurity = left_leaves_weighted_impurity + right_leaves_weighted_impurity
                 num_leaves = left_num_leaves + right_num_leaves
-                costs.append((path_to_here, (node_weighted_impurity - leaves_weighted_impurity) / (num_leaves + 1)))#, num_leaves))
+                costs.append((path_to_here, (node_weighted_impurity - leaves_weighted_impurity) / (num_leaves + 1)))
                 return leaves_weighted_impurity, num_leaves
             return node_weighted_impurity, 1
         def recurse_to_prune(node, path_from_here):
@@ -359,12 +361,14 @@ class DecisionTreeClassifier:
                 if thresholds[i] == thresholds[i - 1]: continue
 
                 # The impurity of a split is the weighted average of the impurity of the children.
-                impurity = ((impurity_sum_left / i) + (impurity_sum_right / (N-i))) / N
+                # Note that conceptually, we're dividing each child twice by its population to get probabilities, then multiplying by the population again.
+                # This means the visible effect is a single multiplication.
+                impurity = ((impurity_sum_left / i) + (impurity_sum_right / (N-i))) / N 
 
                 weighted_impurity_decrease = (impurity_parent - impurity) * N / self.num_samples_total 
 
                 if weighted_impurity_decrease > best_splits[idx][1]:
-                    best_splits[idx][0] = (thresholds[i] + thresholds[i - 1]) / 2  # midpoint
+                    best_splits[idx][0] = (thresholds[i] + thresholds[i - 1]) / 2  # Midpoint
                     best_splits[idx][1] = weighted_impurity_decrease
                     if not found_one_split: found_one_split = True
 
@@ -378,7 +382,6 @@ class DecisionTreeClassifier:
         N = y.size
         num_samples_per_class = np.array([np.sum(y == c) for c in range(self.n_classes)],dtype=np.int64)
         impurity = self._impurity_sum(num_samples_per_class) / (N**2)
-        #impurity = self._impurity(num_samples_per_class, N)
         # Get modal class number and convert back into class label.
         predicted_class = list(self.class_index.keys())[list(self.class_index.values()).index(np.argmax(num_samples_per_class))]
         node = Node(
@@ -431,13 +434,13 @@ class DecisionTreeClassifier:
             if extra and node.feature_index != None: path.append((node.feature_index, node.threshold, lr))
             node = child
         # Return prediction alongside decision path and factual explanation.
-        if extra == 'explain': return node.predicted_class, path, self._path_to_explanation(path)
+        if extra == 'explain': return node.predicted_class, path, self._tests_to_explanation(path)
         elif extra == 'leaf_uid': return node.predicted_class, int(''.join(['1'] + [str(n[2]) for n in path]), 2) # <--- IMPORTANT TO ADD AN EXTRA 1 AT THE START SO THAT 0s DON'T GET CHOPPED OFF.
         # Just return prediction.
         return node.predicted_class
 
 
-    def _path_to_explanation(self, path):
+    def _tests_to_explanation(self, path):
         explanans = {}
         for i, t, lr in path:
             f = self.feature_names[i]

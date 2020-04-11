@@ -9,11 +9,6 @@ Some details also taken from: Silva, A., et al. "Optimization Methods for Interp
 
                               Frosst, N., and G. Hinton. "Distilling a Neural Network Into a Soft Decision Tree". 
                               ArXiv:1711.09784 [Cs, Stat], 27 November 2017. http://arxiv.org/abs/1711.09784.
-
-TODO: Bound per-leaf predictions to range of dataset.
-
-TODO: Classification mode from Frosst and Hinton.
-
 """
 
 import numpy as np
@@ -26,18 +21,19 @@ class DifferentiableDecisionTree:
                  output_size,
                  lr_y,
                  lr_w,
+                 y_lims,       # Used to initialise and place limits on per_leaf predictions.
 
-                 beta = 1
+                 beta = 1,     # Temperature parameter moderating the degree of crispness in the tree. Higher value = more crisp.
+                 w_init_sd = 0 # Standard deviation for initialising weights.
                 ):
 
-        # Tree parameters.
         self.depth = depth
         self.num_leaves = 2**self.depth
         self.input_size = input_size
         self.output_size = output_size
-        self.beta = beta # Temperature parameter moderating the degree of stochasticity in the tree.
-
-        # Optimisation parameters.
+        self.y_lims = y_lims
+        self.beta = beta                
+        self.w_init_sd = w_init_sd
         self.lr_y = lr_y
         self.lr_w = lr_w
 
@@ -49,10 +45,10 @@ class DifferentiableDecisionTree:
         def recurse(depth_remaining):
             node = Node()
             if depth_remaining == 0: 
-                node._init_leaf(self.output_size, sd_y=0.01)
+                node._init_leaf(self.output_size, y_lims=self.y_lims)
                 self.leaves.append(node)
             else:
-                node._init_internal(self.input_size, sd_w=2) # depth_remaining / (self.input_size * self.beta) )
+                node._init_internal(self.input_size, sd_w=self.w_init_sd) 
                 node.left = recurse(depth_remaining-1)
                 node.right = recurse(depth_remaining-1)
             return node
@@ -60,16 +56,16 @@ class DifferentiableDecisionTree:
         self.tree = recurse(self.depth)
 
     
-    def initialise_leaves(self, T):
-        """Initialise per-leaf predictions using the min/max values of T."""
-        min_T = np.min(T, axis=0)
-        max_T = np.max(T, axis=0)
-        for leaf in self.leaves:
-            leaf.y = np.random.uniform(min_T, max_T)
+    # def initialise_weights_from_average(self, x):
+    #     """Initialise weights using a single 'average' instance x.
+    #     Set weights so that its membership is split evenly across the leaves.
+    #     """
+    #     x = np.append(1, x)
+    #     print(self.tree._mu(x, self.beta))
 
     
-    def train_on_batch(self, X, T):
-        """Description."""
+    def update_step(self, X, T):
+        """Perform  a gradient update using X and T."""
         # Reshape input if required.
         X = np.array(X); T = np.array(T)
         if len(np.shape(X)) == 1: X = X.reshape(1,-1); T = T.reshape(1,-1)
@@ -84,6 +80,9 @@ class DifferentiableDecisionTree:
         dL_dys = np.mean(mus * L, axis=0)
         for l, leaf in enumerate(self.leaves):
             leaf.y += self.lr_y * dL_dys[l]
+            # Clip within limits.
+            if self.y_lims != None:
+                leaf.y = np.clip(leaf.y, self.y_lims[0], self.y_lims[1])
 
         # Update decision node parameters.
         mus_one_level_down = mus
@@ -169,14 +168,14 @@ class Node:
         self.isleaf = False
 
     
-    def _init_leaf(self, output_size, sd_y):
-        """Initialise parameters for a leaf node."""
+    def _init_leaf(self, output_size, y_lims):
+        """Use random uniform sample to initialise predictions for a leaf node."""
         self.isleaf = True
-        self.y = np.random.normal(scale=[sd_y]*output_size) 
+        self.y = np.random.uniform(low=y_lims[0], high=y_lims[1]) 
 
     
     def _init_internal(self, input_size, sd_w):
-        """Initialise parameters for an internal node."""
+        """Use Gaussian to initialise weights for an internal node."""
         self.w = np.random.normal(scale=[sd_w*input_size]+[sd_w]*input_size, size=input_size+1)                
 
     
