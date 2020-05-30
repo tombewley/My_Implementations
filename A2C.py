@@ -1,5 +1,5 @@
 '''
-Code for (Asynchronous) Advantage Actor-Critic.
+Code for Advantage Actor-Critic.
 Adapted from: http://inoryy.com/post/tensorflow2-deep-reinforcement-learning/
 '''
 
@@ -77,6 +77,10 @@ class Agent:
         self.t = 0 # Total timesteps seen.
         self.i = 0 # Counter used to determine when to train (batch size reached).  
         self.update_count = 0 # Number of updates completed. 
+
+    
+    def act(obs):
+        return self.model.action_value(obs)
 
 
     def run(self, obs, action, value, next_obs, reward, done):

@@ -9,6 +9,14 @@ Some details also taken from: Silva, A., et al. "Optimization Methods for Interp
 
                               Frosst, N., and G. Hinton. "Distilling a Neural Network Into a Soft Decision Tree". 
                               ArXiv:1711.09784 [Cs, Stat], 27 November 2017. http://arxiv.org/abs/1711.09784.
+
+
+TODO: Initialise beta using smoothness of data (Fourier transform?
+      Initialise y based on density in data - just randomly sample y values from data itself?
+        Risk then of converging to one if highly unbalanced.
+
+
+
 """
 
 import numpy as np
@@ -31,6 +39,7 @@ class DifferentiableDecisionTree:
         self.num_leaves = 2**self.depth
         self.input_size = input_size
         self.output_size = output_size
+        assert len(y_lims) == 2 and len(y_lims[0]) == output_size, 'Need upper and lower lim for each output.'
         self.y_lims = y_lims
         self.beta = beta                
         self.w_init_sd = w_init_sd
@@ -45,15 +54,27 @@ class DifferentiableDecisionTree:
         def recurse(depth_remaining):
             node = Node()
             if depth_remaining == 0: 
-                node._init_leaf(self.output_size, y_lims=self.y_lims)
-                self.leaves.append(node)
+                node._init_leaf(self.y_lims)
+                self.leaf_nodes.append(node)
             else:
                 node._init_internal(self.input_size, sd_w=self.w_init_sd) 
                 node.left = recurse(depth_remaining-1)
                 node.right = recurse(depth_remaining-1)
+                self.internal_nodes.append(node)
             return node
-        self.leaves = []
+        self.leaf_nodes = []
+        self.internal_nodes = []
         self.tree = recurse(self.depth)
+        self.w = np.array([node.w for node in self.internal_nodes])
+        self.y = np.array([node.y for node in self.leaf_nodes])
+        # Internal ancestors of each leaf node, along with the decision direction.
+        offset = np.cumsum([0] + [2**d for d in range(self.depth-1)])
+        self.ancestors = []
+        for l in range(2**self.depth):
+            path = self._depth_node_to_path(self.depth, l)
+            ancestors = np.array([0]+[int(path[:d], 2) for d in range(1,self.depth)]) + offset
+            signs = np.array([int(s) for s in path])
+            self.ancestors.append([ancestors, signs])
 
     
     # def initialise_weights_from_average(self, x):
@@ -75,16 +96,16 @@ class DifferentiableDecisionTree:
         # Compute loss.
         Y, mus, ys = self.predict(X, have_preprocessed=True, composition=True)
         L = T - Y
-
+        
         # Update leaf parameters.
         dL_dys = np.mean(mus * L, axis=0)
-        for l, leaf in enumerate(self.leaves):
-            leaf.y += self.lr_y * dL_dys[l]
+        for l, node in enumerate(self.leaf_nodes):
+            node.y += self.lr_y * dL_dys[l]
             # Clip within limits.
             if self.y_lims != None:
-                leaf.y = np.clip(leaf.y, self.y_lims[0], self.y_lims[1])
+                node.y = np.clip(node.y, self.y_lims[0], self.y_lims[1])
 
-        # Update decision node parameters.
+        # Update internal node parameters.
         mus_one_level_down = mus
         ys_one_level_down = np.repeat(ys[None,:,:], num_instances, axis=0)
         for d in reversed(range(self.depth)):
@@ -97,11 +118,14 @@ class DifferentiableDecisionTree:
                 mus_this_level[:,n] = np.sum(mu_children, axis=1)
                 mu_children_norm = mu_children / mus_this_level[:,n][:,None]
                 ys_this_level[:,n,:] = np.einsum('ij,ijk->ik', mu_children_norm, y_children)
-                # Update decision node parameters.
                 self._update_node_weights(d, n, X, L, mus_this_level[:,n], mu_children_norm, y_children)
             # Store for next level.
             mus_one_level_down = mus_this_level
             ys_one_level_down = ys_this_level
+        
+        # Update w and y arrays to reflect per-node changes.
+        self.w = np.array([node.w for node in self.internal_nodes])
+        self.y = np.array([node.y for node in self.leaf_nodes])
 
     
     def predict(self, X, have_preprocessed=False, composition=False):
@@ -109,31 +133,32 @@ class DifferentiableDecisionTree:
         # Reshape input if required.
         if not have_preprocessed:
             X = np.array(X)
-            if len(np.shape(X)) == 1: X = X.reshape(1,-1) 
-            num_instances = len(X)
+            if len(X.shape) == 1: X = X.reshape(1,-1) 
             # Add column of 1s to X for bias term.
-            X = np.c_[ np.ones(num_instances), X ]
-        else: num_instances = len(X)
+            X = np.c_[ np.ones(X.shape[0]), X ]
 
-        # Initialise Y, and mus arrays.
-        Y = np.empty((num_instances, self.output_size))
-        mus = np.empty((num_instances, self.num_leaves))
-        # Predict for each instance.
-        for i, x in enumerate(X):
-            mus[i], ys = self._propagate(x, self.tree)
-            Y[i] = np.dot(mus[i], ys)
-        if composition: return Y, mus, ys
+        # Get mu values from all internal nodes.
+        internal_mus = (1 / ( 1 + np.exp( self.beta * np.inner( self.w, X ) )))[None,:,:]
+        internal_mus = np.insert(internal_mus, 1, 1-internal_mus[0],axis=0) # Compute 1 minus these values.
+
+        # Multiply these together to get leaf mus.
+        mus = np.zeros((X.shape[0], 2**self.depth))
+        for l in range(2**self.depth): 
+            ancestors, signs = self.ancestors[l]
+            mus[:,l] = np.prod(internal_mus[signs, ancestors], axis=0)      
+        Y = np.dot(mus, self.y)
+        if composition: return Y, mus, self.y
         return Y
 
     
-    def _propagate(self, x, node, mu=1):
-        """Propagate a single instance x through the tree starting at node,
-        and collect per-leaf membership and prediction."""
-        if node.isleaf: return np.array([mu]), np.array(node.y)
-        mu_left = node._mu(x, self.beta)
-        subtree_left, y_left = self._propagate(x, node.left, mu*mu_left)
-        subtree_right, y_right = self._propagate(x, node.right, mu*(1-mu_left))
-        return np.append(subtree_left, subtree_right), np.vstack((y_left, y_right))
+    # def _propagate(self, x, node, mu=1):
+    #     """Propagate a single instance x through the tree starting at node,
+    #     and collect per-leaf membership and prediction."""
+    #     if node.isleaf: return np.array([mu]), np.array(node.y)
+    #     mu_left = node._mu(x, self.beta)
+    #     subtree_left, y_left = self._propagate(x, node.left, mu*mu_left)
+    #     subtree_right, y_right = self._propagate(x, node.right, mu*(1-mu_left))
+    #     return np.append(subtree_left, subtree_right), np.vstack((y_left, y_right))
 
 
     def _update_node_weights(self, d, n, X, L, mu, mu_children_norm, y_children):
@@ -156,11 +181,8 @@ class DifferentiableDecisionTree:
 
     def _depth_node_to_path(self, d, n):
         """Given a (depth, node) pair, return the path-from-root as a string of 0s and 1s, where 0 = left and 1 = right."""
-        assert n < 2**d
         if d == 0: return ''
-        path = str(bin(n))[2:]
-        path = '0'*(d - len(path)) + path
-        return path
+        return str(bin(n))[2:].zfill(d)
 
 
 class Node:
@@ -168,7 +190,7 @@ class Node:
         self.isleaf = False
 
     
-    def _init_leaf(self, output_size, y_lims):
+    def _init_leaf(self, y_lims):
         """Use random uniform sample to initialise predictions for a leaf node."""
         self.isleaf = True
         self.y = np.random.uniform(low=y_lims[0], high=y_lims[1]) 
@@ -176,9 +198,10 @@ class Node:
     
     def _init_internal(self, input_size, sd_w):
         """Use Gaussian to initialise weights for an internal node."""
-        self.w = np.random.normal(scale=[sd_w*input_size]+[sd_w]*input_size, size=input_size+1)                
+        self.w = np.random.normal(scale=[sd_w*input_size]+[sd_w]*input_size, size=input_size+1)
 
     
-    def _mu(self, X,  beta):
-        """Membership function of this node's left child for an input X."""
-        return 1 / ( 1 + np.exp( beta * np.dot( self.w, X ) ))
+    # def _mu(self, X,  beta):
+    #     #print(beta)
+    #     """Membership function of this node's left child for an input X."""
+    #     return 1 / ( 1 + np.exp( beta * np.inner( self.w, X ) ))
