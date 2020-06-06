@@ -18,7 +18,7 @@ class DecisionTreeClassifier:
                  pw_class_loss =             {},
                  criticality_weight =        0,
                  criticality_method =        'absolute',
-                 weight_predictions =        True,
+                 #weight_predictions =        True,
                  ):
 
         self.max_depth = max_depth
@@ -30,7 +30,7 @@ class DecisionTreeClassifier:
         self.pw_class_loss = pw_class_loss
         self.criticality_weight = criticality_weight
         self.criticality_method = criticality_method
-        self.weight_predictions = weight_predictions
+        #self.weight_predictions = weight_predictions
 
 # ===================================================================================================================
 # PREDICTION AND SCORING
@@ -38,7 +38,7 @@ class DecisionTreeClassifier:
     def predict(self, X, extra=None):
         """Predict class for X."""
         shp = np.shape(X)
-        if len(shp)==1 or np.shape(X)[1]==1: return self._predict(X, extra)
+        if len(shp)==1 or np.shape(X)[0]==1: return self._predict(X, extra)
         else: return [self._predict(inputs, extra) for inputs in X]
 
 
@@ -110,6 +110,7 @@ class DecisionTreeClassifier:
 
         # Set up basic variables.
         X = np.array(X)
+        if len(X.shape) == 1: X = X.reshape(-1,1)
         self.num_samples_total, self.num_features = X.shape
         self.class_index = {c:i for i,c in enumerate(sorted(list(set(y) | set(self.pw_class_loss))))} # Alphanumeric order. Include those in pw_class_loss even if they're not in the dataset.
         self.num_classes = len(self.class_index)
@@ -119,10 +120,8 @@ class DecisionTreeClassifier:
         else:
             assert Q == []; Q = np.zeros(X.shape[0])
         if sample_weight == []:
-            self.using_sample_weight = False
             sample_weight = np.ones(X.shape[0])
         else:
-            self.using_sample_weight = True
             sample_weight = np.array(sample_weight)
         self.total_weight = np.sum(sample_weight)
         if feature_names != None:
@@ -153,22 +152,24 @@ class DecisionTreeClassifier:
     
     def class_loss_to_matrix(self):
         # If unspecified, use 1 - identity matrix.
-        if self.pw_class_loss == {}: self._pwl = 1 - np.identity(self.num_classes)
+        if self.pw_class_loss == {}: self.pwl = 1 - np.identity(self.num_classes)
         # Otherwise use values provided.
         else:
-            self._pwl = np.zeros((self.num_classes,self.num_classes))
+            self.pwl = np.zeros((self.num_classes,self.num_classes))
             for c,losses in self.pw_class_loss.items():
                 for cc,l in losses.items():
-                    # *** Must be symmetric! ***
-                    self._pwl[self.class_index[c],self.class_index[cc]] = l
-                    self._pwl[self.class_index[cc],self.class_index[c]] = l
+                    # NOTE: Currently symmetric.
+                    self.pwl[self.class_index[c],self.class_index[cc]] = l
+                    self.pwl[self.class_index[cc],self.class_index[c]] = l
         # Normalise by max value.
-        self._pwl /= np.max(self._pwl)
+        self.pwl /= np.max(self.pwl)
 
     
     def _grow_tree(self, X, y, sample_weight, Q, depth=0):
         """Build a decision tree by recursively finding the best split."""
+        
         # Calculate a bunch of properties for this node.
+        # TODO: There are definitely some repeated calculations happening here.
         N = y.size
         y_one_hot = np.zeros((N, self.num_classes))
         y_one_hot[np.arange(N), y] = 1
@@ -176,16 +177,21 @@ class DecisionTreeClassifier:
         weighted_class_counts = np.sum(y_one_hot*sample_weight.reshape(-1,1), axis=0)
         weight = np.sum(weighted_class_counts)
         weight_fraction = weight / self.total_weight
-        impurity_sum = self._impurity_sum(class_counts, weighted_class_counts, y, Q)
-        impurity = impurity_sum / (N**2)
-        # Get predicted class number and convert back into class label.
-        if self.weight_predictions:
-            # If factoring in sample weights into predictions.
-            predicted_class = list(self.class_index.keys())[list(self.class_index.values()).index(np.argmax(weighted_class_counts))]
-        else:
-            # If just using class counts.
-            predicted_class = list(self.class_index.keys())[list(self.class_index.values()).index(np.argmax(class_counts))]
         
+        # Get predicted class number and convert back into class label.
+        # if self.weight_predictions:
+        #     # If factoring in sample weights into predictions.
+        predicted_class = list(self.class_index.keys())[list(self.class_index.values()).index(np.argmax(weighted_class_counts))]
+        # else:
+        #     # If just using class counts.
+        #     predicted_class = list(self.class_index.keys())[list(self.class_index.values()).index(np.argmax(class_counts))]
+        
+        # Calculate impurity at this node.
+        # TODO: Only need to do this at the root; can propagate down.
+        imp_per_class, impurity_sum = self._impurity_sum(class_counts, weighted_class_counts)#, y, Q)
+        impurity = impurity_sum / (N**2)
+
+        # Store the node properties.
         node = Node(
             impurity=impurity,
             num_samples=N,
@@ -198,9 +204,10 @@ class DecisionTreeClassifier:
         # Split recursively until maximum depth or stopping criterion is reached.
         if impurity > 0 and depth < self.max_depth and N >= self.min_samples_split_abs and N >= 2*self.min_samples_leaf_abs and weight_fraction >= self.min_weight_fraction_split:
             
-            # print('Depth',depth+1)
+            print('Depth',depth+1)
             
-            best_splits = self._best_splits(X, y, N, weight, sample_weight, Q, class_counts, weighted_class_counts, impurity, impurity_sum)
+            # Find the best split on each feature dimension.
+            best_splits = self._best_splits(X, y, N, weight, sample_weight, Q, imp_per_class, impurity_sum)
             if best_splits is not None:   
 
                 # Choose feature to split on.  
@@ -211,15 +218,16 @@ class DecisionTreeClassifier:
                 elif self.split_mode == 'stochastic':
                     # Sample in proportion to impurity decrease.
                     idx = np.random.choice(range(self.num_features), p=impurity_decreases/sum(impurity_decreases))
-                thr, _, _ = best_splits[idx]
-
-                # Create two child nodes.
-                indices_left = X[:, idx] < thr                
-                if sum(indices_left) == 0: indices_left = X[:, idx] <= thr # This important line prevents creating an empty leaf due to numerical precision weirdness.
-                X_left, y_left, sample_weight_left, Q_left = X[indices_left], y[indices_left], sample_weight[indices_left], Q[indices_left]
-                X_right, y_right, sample_weight_right, Q_right = X[~indices_left], y[~indices_left], sample_weight[~indices_left], Q[~indices_left]
+                
+                # Store the chosen feature index and threshold.
                 node.feature_index = idx
-                node.threshold = thr
+                node.threshold, _, _ = best_splits[idx]
+
+                # Split data and create two child nodes.
+                indices_left = X[:, idx] < node.threshold                
+                if sum(indices_left) == 0: indices_left = X[:, idx] <= node.threshold # This important line prevents creating an empty leaf due to numerical precision weirdness.
+                X_left, y_left, sample_weight_left, Q_left = X[indices_left], y[indices_left], sample_weight[indices_left], Q[indices_left]
+                X_right, y_right, sample_weight_right, Q_right = X[~indices_left], y[~indices_left], sample_weight[~indices_left], Q[~indices_left]                                
                 node.left = self._grow_tree(X_left, y_left, sample_weight_left, Q_left, depth + 1)
                 node.right = self._grow_tree(X_right, y_right, sample_weight_right, Q_right, depth + 1)
 
@@ -227,38 +235,37 @@ class DecisionTreeClassifier:
                 self.feature_importances[idx] += impurity_decreases[idx]
                 self.potential_feature_importances += impurity_decreases
 
-            # else:
-            #     print('Depth',depth+1,class_counts,weighted_class_counts)
-            #     print('Parent impurity', impurity)
-            #     print('Best splits', best_splits)
-
         return node
 
 
-    def _best_splits(self, X, y, N, parent_weight, sample_weight, Q, class_counts_parent, weighted_class_counts_parent, impurity_parent, impurity_sum_parent):
+    def _best_splits(self, X, y, N, parent_weight, sample_weight, Q, imp_per_class_parent, impurity_sum_parent):
         """Find the best split location for each feature at a node."""
 
         # Loop through all features.
-        # best_splits = np.array([[None, self.min_impurity_decrease] for idx in range(self.num_features)])
         best_splits = np.array([[None, 0, impurity_sum_parent] for idx in range(self.num_features)])       
         found_one_split = False
-        indices = range(len(y))
         for idx in range(self.num_features):
 
-            # print('   Feature',idx+1,'/',self.num_features)
+            print('   Feature',idx+1,'/',self.num_features)
 
             # Sort data along selected feature.
-            thresholds, y_sorted, sample_weight_sorted, indices_sorted = zip(*sorted(zip(X[:, idx], y, sample_weight, indices)))
-            if self.criticality_weight > 0: Q_sorted = Q[tuple([indices_sorted])]
+            sort = np.argsort(X[:,idx])
+            thresholds = X[sort,idx]
+            y_sorted = y[sort]
+            sample_weight_sorted = sample_weight[sort]
+            if self.criticality_weight > 0: Q_sorted = Q[indices_sorted,:]
             else: Q_sorted = Q
         
             # Initialise counts and impurities for the two children.
-            class_counts_left = np.zeros_like(class_counts_parent)
-            weighted_class_counts_left = np.zeros_like(class_counts_parent)
-            class_counts_right = class_counts_parent.copy()
-            weighted_class_counts_right = weighted_class_counts_parent.copy()
+            # class_counts_left = np.zeros_like(class_counts_parent)
+            # weighted_class_counts_left = np.zeros_like(class_counts_parent)
+            # class_counts_right = class_counts_parent.copy()
+            # weighted_class_counts_right = weighted_class_counts_parent.copy()
             impurity_sum_left = 0.
             impurity_sum_right = impurity_sum_parent.copy()
+
+            imp_per_class_left = np.zeros_like(imp_per_class_parent)
+            imp_per_class_right = imp_per_class_parent.copy()
 
             # print('START')
             # print('left = {}, impurity = {}'.format(class_counts_left, impurity_sum_left))
@@ -266,19 +273,23 @@ class DecisionTreeClassifier:
             # print('')
             
             # Loop through all possible split positions for this feature.
-            for i in tqdm(range(self.min_samples_leaf_abs, N+1-self.min_samples_leaf_abs)): # Only consider splits that leave at least min_samples_leaf_abs at each child.
+            for i in range(self.min_samples_leaf_abs, N+1-self.min_samples_leaf_abs): # Only consider splits that leave at least min_samples_leaf_abs at each child.
                 c = y_sorted[i-1]
-                q = Q_sorted[i-1]
+                # q = Q_sorted[i-1]
                 w = sample_weight_sorted[i-1]
-                class_counts_left[c] += 1
-                weighted_class_counts_left[c] += w
-                class_counts_right[c] -= 1
-                weighted_class_counts_right[c] -= w
+
+                w_pwl = w * self.pwl[c]
+                imp_per_class_left += w_pwl
+                imp_per_class_right -= w_pwl
 
                 # Compute impurity incrementally to improve speed.
-                impurity_sum_left += self._impurity_increment(w, class_counts_left, weighted_class_counts_left, c, q, y_sorted[:i-1], Q_sorted[:i-1])
-                impurity_sum_right -= self._impurity_increment(w, class_counts_right, weighted_class_counts_right, c, q, y_sorted[i:], Q_sorted[i:])
-
+                # NOTE: Currently assumes self.pwl is symmetric. 
+                impurity_sum_left += 2 * (w * imp_per_class_left[c])
+                impurity_sum_right -= 2 * (w * imp_per_class_right[c])
+                
+                # impurity_sum_left += (w * imp_per_class_left[c]) + imp_left_in[c] 
+                # impurity_sum_right -= (w * imp_per_class_right[c]) + imp_right_in[c]
+                
                 # Skip if this threshold is the same as the previous one.
                 if thresholds[i] == thresholds[i - 1]: continue
 
@@ -298,7 +309,7 @@ class DecisionTreeClassifier:
                 impurity_sum = impurity_sum_left + impurity_sum_right
                 #if weighted_impurity_decrease > best_splits[idx][1]:
                 if impurity_sum < best_splits[idx][2]:
-                    impurity_decrease = (impurity_sum_parent - impurity_sum) * N / self.num_samples_total 
+                    impurity_decrease = (impurity_sum_parent - impurity_sum) # * parent_weight / self.total_weight 
                     if impurity_decrease >= self.min_impurity_decrease:
                         best_splits[idx][0] = (thresholds[i] + thresholds[i - 1]) / 2 # Midpoint
                         best_splits[idx][1] = impurity_decrease
@@ -309,21 +320,22 @@ class DecisionTreeClassifier:
         else: return None
 
 
-    def _impurity_sum(self, class_counts, weighted_class_counts, y, Q):
-        gini = np.dot(np.dot(weighted_class_counts, self._pwl), class_counts)
-        if self.criticality_weight == 0: return gini
-        return gini + (self.criticality_weight * sum(
-                       self._criticality_per_sample(class_counts, c, q)
-                       for c, q in zip(y, Q))) 
+    def _impurity_sum(self, class_counts, weighted_class_counts):#, y, Q):
+        imp_per_class = np.inner(self.pwl, weighted_class_counts)
+        return imp_per_class, np.dot(weighted_class_counts, imp_per_class) 
+        #if self.criticality_weight == 0: return gini
+        # return gini + (self.criticality_weight * sum(
+        #                self._criticality_per_sample(class_counts, c, q)
+        #                for c, q in zip(y, Q))) 
 
 
-    def _impurity_increment(self, w, class_counts, weighted_class_counts, c, q, other_y, other_Q): 
-        gini = (w * np.dot(self._pwl[c], class_counts)) + np.dot(self._pwl[c], weighted_class_counts)
-        if self.criticality_weight == 0: return gini
-        # Need to compute criticality change both ways: from the moved point outwards, and vice versa from all the others. 
-        criticality_out = self._criticality_per_sample(class_counts, c, q) 
-        criticality_in = sum(self._c(qq[cc], qq[c]) for cc, qq in zip(other_y, other_Q)) 
-        return gini + (self.criticality_weight * (criticality_out + criticality_in))
+    # def _impurity_increment(self, w, class_counts, weighted_class_counts, c):#, q, other_y, other_Q): 
+    #     gini = (w * np.dot(self.pwl[c], class_counts)) + np.dot(self.pwl[c], weighted_class_counts)
+    #     if self.criticality_weight == 0: return gini
+    #     # Need to compute criticality change both ways: from the moved point outwards, and vice versa from all the others. 
+    #     # crit_from = self._criticality_per_sample(class_counts, c, q) 
+    #     # crit_to = sum(self._c(qq[cc], qq[c]) for cc, qq in zip(other_y, other_Q)) 
+    #     # return gini + (self.criticality_weight * (crit_from + crit_to))
 
         
     def _criticality_per_sample(self, class_counts, c, q):

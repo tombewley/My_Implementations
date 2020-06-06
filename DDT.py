@@ -85,17 +85,19 @@ class DifferentiableDecisionTree:
     #     print(self.tree._mu(x, self.beta))
 
     
-    def update_step(self, X, T):
+    def update_step(self, X, T, print_mae_before=False):
         """Perform  a gradient update using X and T."""
         # Reshape input if required.
         X = np.array(X); T = np.array(T)
-        if len(np.shape(X)) == 1: X = X.reshape(1,-1); T = T.reshape(1,-1)
+        #if len(np.shape(X)) == 1: X = X.reshape(1,-1); T = T.reshape(1,-1)
         num_instances = len(X)
         # Add column of 1s to X for bias term.
         X = np.c_[ np.ones(num_instances), X ]
         # Compute loss.
         Y, mus, ys = self.predict(X, have_preprocessed=True, composition=True)
         L = T - Y
+
+        if print_mae_before: print(f'MAE before = {np.mean(np.abs(L))}')
         
         # Update leaf parameters.
         dL_dys = np.mean(mus * L, axis=0)
