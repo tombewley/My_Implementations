@@ -631,6 +631,15 @@ class AugDT:
         return before, after
 
     
+    def split_into_episodes(self, p, n):
+        """
+        Given lists of predecessor / successor relations (p, n), 
+        split the indices by episode and put in temporal order.
+        """
+        return [self.sample_episode([], n, index[0])[1] 
+                for index in np.argwhere(p < 0)]
+
+    
     def compute_returns(self, r, p, n): 
         """
         Compute returns for a set of samples.
@@ -736,7 +745,7 @@ class AugDT:
             self.transition_probs[address] = self.leaf_transition_probs(address=address)
 
 
-    def path_between_leaves(self, start_address, end_address, reverse=False, cost_by='prob', triplet=False):
+    def path_leaf_to_leaf(self, start_address, end_address, reverse=False, cost_by='prob', triplet=False):
         """
         Use a modified Dijkstra algorithm to find the best sequence of transitions between two leaves.
         Where "best" is measured by one of several metrics.
@@ -755,7 +764,6 @@ class AugDT:
         costs = {addr:[None, worst_cost, None, False] for addr in self.leaf_addresses()}
         costs[start_address][1] = best_cost
         depth = 0
-        #with tqdm(total=len(costs)-1) as pbar:
         while True:
             depth += 1
             # Sort unvisited leaves by cost.
@@ -768,7 +776,6 @@ class AugDT:
             if address == end_address: break
             # Mark the leaf as visited.
             costs[address][3] = True
-            #pbar.update(1)
             if triplet: 
                 # For triplet transition, condition on previous leaf.
                 if reverse: next_address = previous_address; previous_address = False
@@ -796,30 +803,36 @@ class AugDT:
         return path, cost
 
 
-    def path_to_condition(self, start_address, 
-                          features=[], feature_ranges=[], attributes=None, attribute_ranges=None, 
-                          reverse=False, cost_by='prob', triplet=False, try_reuse_df=True):
+    def path_between(self, start_addresses=False, start_features={}, start_attributes={}, 
+                           end_addresses=False, end_features={}, end_attributes={}, 
+                           reverse=False, cost_by='prob', triplet=False, try_reuse_df=True):
         """
-        Use the path_between_leaves method to find a path to *any* leaf matching a condition.
-        This could be on feature or attribute values.
+        Use the path_leaf_to_leaf method to find a path between *any* pair of leaves matching condtions.
+        Conditions could be on feature or attribute values.
+        Can optionally specify a single start or end leaf.
         """
         if not(try_reuse_df and self.have_df): df = self.to_dataframe()
         df = self.df.loc[self.df['kind']=='leaf'] # Only care about leaves.
-        if features != []:
-            assert len(feature_ranges) == len(features)
-            feature_ranges = np.array(feature_ranges)
-            # Filter down to leaves that overlap with the feature ranges.
-            df = self.feature_core(df, features, feature_ranges)
+        
+        # List start addresses.
+        if start_addresses == False:
+            start_addresses = self.df_filter(df, start_features, start_attributes).index.values
+        elif type(start_addresses) == tuple: start_addresses = [start_addresses]
+        # List end addresses.
+        if end_addresses == False:
+            end_addresses = self.df_filter(df, end_features, end_attributes).index.values
+        elif type(end_addresses) == tuple: end_addresses = [end_addresses]
+
         # Find the best path to each leaf matching the condition.
-        path = False; cost = False
-        for end_address in df.index.values:
-            path_candidate, cost_candidate = self.path_between_leaves(start_address, end_address, reverse, cost_by, triplet)
-            if path_candidate != False:
-                # If this is the best one found so far, store.
-                if cost == False or \
-                (cost_by == 'prob' and cost_candidate > cost):
-                    path = path_candidate; cost = cost_candidate
-        return path, cost
+        paths = []; costs = []
+        with tqdm(total=len(start_addresses)*len(end_addresses)) as pbar:
+            for addr_s in start_addresses:
+                for addr_e in end_addresses:
+                    path, cost = self.path_leaf_to_leaf(addr_s, addr_e, reverse, cost_by, triplet)
+                    pbar.update(1)
+                    if path != False:
+                        paths.append(path); costs.append(cost)
+        return paths, costs
 
 
     # NOTE: These two methods are currently unused.
@@ -952,7 +965,7 @@ class AugDT:
         of the counterfactual samples lying within it. 
         It can be defined for all nodes, not just leaves.
         """
-        assert self.cf.num_samples > 0
+        assert self.tree != None and self.cf != None and self.cf.num_samples > 0, 'Must have tree and counterfactual data.'
         def recurse(node):
             if node.cf_indices != []: 
                 regrets = self.cf.regret[np.array(node.cf_indices)]
@@ -962,6 +975,25 @@ class AugDT:
                 recurse(node.left)
                 recurse(node.right)  
         recurse(self.tree)
+
+
+    def highlights(self, window=10):
+        """
+        HIGHLIGHTS algorithm (Amir et al, AAMAS 2018).
+        """
+        assert self.tree != None and self.cf != None and self.cf.num_samples > 0, 'Must have tree and counterfactual data.'
+        # Split samples into episodes
+        ep_indices = self.split_into_episodes(self.p, self.n)
+        # Use the extant tree to get a criticality time series for each episode. 
+        ep_criticality = [self.predict(self.o[ep], attributes=['criticality'])
+                               for ep in ep_indices]
+        # Smooth the time series.
+        ep_criticality_smoothed = [running_mean(crit, window) for crit in ep_criticality]
+        # Order the episodes by their total (smoothed) criticality.
+        ep_criticality_sums = np.argsort([np.nansum(crit) for crit in ep_criticality_smoothed])[::-1]
+
+        return [ep_criticality_smoothed[ep] for ep in ep_criticality_sums]
+
 
 
 # ===================================================================================================================
@@ -1076,37 +1108,43 @@ class AugDT:
         if out_file == None: return self.df
         else: self.df.to_csv(out_file+'.csv', index=False)
 
-    
-    def feature_core(self, df, features, core_ranges):
-        """
-        Identify the subset of nodes that overlap with a set of feature ranges.
-        Compute the proportion of overlap for each.
-        """
-        # Build query.
-        query = []
-        for i, f in enumerate(features):
-            # Determine whether two ranges overlap:
-            # https://stackoverflow.com/questions/325933/determine-whether-two-date-ranges-overlap/325964#325964
-            if core_ranges[i][1] not in (np.inf, None):
-                query.append(f'`{f} >`<={core_ranges[i][1]}')
-            if core_ranges[i][0] not in (-np.inf, None):
-                query.append(f'`{f} <`>={core_ranges[i][0]}')
 
-        # Submit to filter dataframe.
-        core = df.query(' & '.join(query))
-        # Compute overlap proportions and store this in a new column of the dataframe.
-        # There's a lot of NumPy wizardry going on here!
-        node_ranges = np.dstack((core[[f'{f} >' for f in features]].values,
-                                 core[[f'{f} <' for f in features]].values))
-        overlap = np.maximum(0, np.minimum(node_ranges[:,:,1], core_ranges[:,1]) 
-                              - np.maximum(node_ranges[:,:,0], core_ranges[:,0]))
-        core['overlap'] = np.prod(overlap / (node_ranges[:,:,1] - node_ranges[:,:,0]), axis=1)                         
-        return core
+    def df_filter(self, df, features={}, attributes={}):
+            """
+            Filter the subset of nodes that overlap with a set of feature ranges,
+            and / or have attributes within specified ranges.
+            If using features, compute the proportion of overlap for each.
+            """
+            # Build query.
+            query = []; feature_ranges = []
+            for f, r in features.items():
+                feature_ranges.append(r)
+                # Filter by features.
+                #    Determine whether two ranges overlap:
+                #    https://stackoverflow.com/questions/325933/determine-whether-two-date-ranges-overlap/325964#325964
+                query.append(f'`{f} <`>={r[0]}')
+                query.append(f'`{f} >`<={r[1]}')
+            for attr, r in attributes.items():
+                # Filter by attributes.
+                query.append(f'{attr}>={r[0]} & {attr}<={r[1]}')
+            # Filter dataframe.
+            df = df.query(' & '.join(query))
+            if features != {}:
+                # If using features, compute overlap proportions,
+                # and store this in a new column of the dataframe.
+                # There's a lot of NumPy wizardry going on here!
+                feature_ranges = np.array(feature_ranges)
+                node_ranges = np.dstack((df[[f'{f} >' for f in features]].values,
+                                    df[[f'{f} <' for f in features]].values))
+                overlap = np.maximum(0, np.minimum(node_ranges[:,:,1], feature_ranges[:,1]) 
+                                    - np.maximum(node_ranges[:,:,0], feature_ranges[:,0]))
+                df['overlap'] = np.prod(overlap / (node_ranges[:,:,1] - node_ranges[:,:,0]), axis=1)                         
+            return df
 
     
-    def visualise(self, features, attributes=['action'], lims=[], 
+    def visualise(self, features, attributes=[None], lims=[], 
                   visualise=True, axes=[],
-                  action_colours=['w','w'], cmap_percentiles=[5,95], cmap_midpoints=[], density_percentile=90,
+                  action_colours=None, cmap_percentiles=[5,95], cmap_midpoints=[], density_percentile=90,
                   alpha_by_density=False, edge_colour=None, show_addresses=False, try_reuse_df=True):
         """
         Visualise attributes across one or two features, 
@@ -1122,14 +1160,15 @@ class AugDT:
         lims = np.array(lims).astype(float)
         fi = [self.feature_names.index(f) for f in features]
         np.copyto(lims, self.global_feature_lims[fi], where=np.isnan(lims))
-        cmaps = {'action':custom_cbar, # For regression only.
-                 'action_impurity':custom_cbar.reversed(),
-                 'value':custom_cbar,
-                 'value_impurity':custom_cbar.reversed(),
-                 'criticality':custom_cbar,
-                 'criticality_impurity':custom_cbar.reversed(),
+        cmaps = {'action':custom_cmap, # For regression only.
+                 'action_impurity':custom_cmap.reversed(),
+                 'value':custom_cmap,
+                 'value_impurity':custom_cmap.reversed(),
+                 'criticality':custom_cmap,
+                 'criticality_impurity':custom_cmap.reversed(),
                  'sample_density':matplotlib.cm.gray,
                  'weight_density':matplotlib.cm.gray,
+                 None:None
                  }
         if type(attributes) == str: attributes = [attributes]
         for attr in attributes: 
@@ -1141,7 +1180,6 @@ class AugDT:
         if cmap_midpoints == []: 
             # If cmap midpoints not specified, use defaults.
             cmap_midpoints = [None for f in attributes]   
-
         if n < self.num_features: marginalise = True
         else: marginalise = False
         regions = {}                  
@@ -1163,7 +1201,8 @@ class AugDT:
                 if outside_lims: continue
                 if n == 1: xy.append(0)
                 regions[address] = {'xy':xy, 'width':width, 'height':height, 'alpha':1}  
-                for attr in attributes_plus: regions[address][attr] = leaf[attr]   
+                for attr in attributes_plus: 
+                    if attr != None: regions[address][attr] = leaf[attr]   
         else:
             # Get all unique values mentioned in partitions for these features.
             f1 = features[0]
@@ -1179,24 +1218,23 @@ class AugDT:
                 min1 = max(min1, lims[0][0])
                 max1 = min(max1, lims[0][1])
                 width = max1 - min1
+                feature_ranges = {features[0]: [min1, max1]}
                 if n == 1: 
                     xy = [min1, 0]
-                    ranges = np.array([[min1, max1]])
                     height = 1
                 else: 
                     if min2 >= lims[1][1] or max2 <= lims[1][0]: continue
                     min2 = max(min2, lims[1][0])
                     max2 = min(max2, lims[1][1])
-                    ranges = np.array([[min1, max1], [min2, max2]])
+                    feature_ranges[features[1]] = [min2, max2]
                     xy = [min1, min2]
                     height = max2 - min2   
-
                 # Find "core": the leaves that overlap with the feature range(s).
-                core = self.feature_core(df, features, ranges)
-
+                core = self.df_filter(df, features=feature_ranges)
                 regions[m] = {'xy':xy, 'width':width, 'height':height, 'alpha':1}             
                 for attr in attributes_plus:
-                    if attr == 'action' and self.classifier:
+                    if attr == None: pass
+                    elif attr == 'action' and self.classifier:
                         # Special case for action with classification: discrete values.
                         regions[m][attr] = np.argmax(np.dot(np.vstack(core['weighted_action_counts'].values).T, 
                                                                       core['overlap'].values.reshape(-1,1)))
@@ -1245,7 +1283,8 @@ class AugDT:
                     ax.add_patch(matplotlib.patches.Rectangle(xy=[lims[0][0],lims[1][0]], width=lims[0][1]-lims[0][0], height=lims[1][1]-lims[1][0], 
                                  facecolor='k', hatch=None, edgecolor=None, zorder=-11))
 
-                if attr == 'action' and self.classifier:
+                if attr == None: pass
+                elif attr == 'action' and self.classifier:
                     assert action_colours != None, 'Specify colours for discrete actions.'
                 else: 
                     attr_list = [r[attr] for r in regions.values()]
@@ -1277,7 +1316,8 @@ class AugDT:
                         matplotlib.pyplot.colorbar(dummy, cax=axins)
                     else: matplotlib.pyplot.colorbar(dummy, ax=ax)
                 for m, region in regions.items():
-                    if attr == 'action' and self.classifier: colour = action_colours[region[attr]]
+                    if attr == None: colour = 'w'
+                    elif attr == 'action' and self.classifier: colour = action_colours[region[attr]]
                     else: colour = cmaps[attr](colour_norm(region[attr]))
                     # Don't apply alpha to density plots themselves.
                     if attr in ('sample_density','weight_density'): alpha = 1
@@ -1294,7 +1334,7 @@ class AugDT:
         return regions
 
 
-    def plot_path_2D(self, path, features, ax=None, colour='k', try_reuse_df=True):
+    def plot_path_2D(self, path, features, ax=None, colour='k', alpha=1, try_reuse_df=True):
         """
         Given a path between leaves, plot on the specified feature axes.
         """
@@ -1313,9 +1353,9 @@ class AugDT:
             #matplotlib.pyplot.text(pt[0], pt[1], address, horizontalalignment='center', verticalalignment='center')
             pts.append(pt)
         pts = np.array(pts).T
-        matplotlib.pyplot.plot(pts[0], pts[1], colour)
-        matplotlib.pyplot.scatter(pts[0,0], pts[1,0], c='g', zorder=10)
-        matplotlib.pyplot.scatter(pts[0,-1], pts[1,-1], c='r', zorder=10)        
+        matplotlib.pyplot.plot(pts[0], pts[1], colour, alpha=alpha)
+        matplotlib.pyplot.scatter(pts[0,0], pts[1,0], c='y', alpha=alpha, zorder=10)
+        matplotlib.pyplot.scatter(pts[0,-1], pts[1,-1], c='k', alpha=alpha, zorder=10)        
         return pts
 
 
@@ -1379,9 +1419,9 @@ class counterfactual():
 
 
 # ===================================================================================================================
-# SOME EXTRA BITS FOR VISUALISATION.
+# SOME EXTRA BITS.
 
-
+# Colour normaliser.
 # From https://github.com/mwaskom/seaborn/issues/1309#issue-267483557
 class MidpointNormalize(matplotlib.colors.Normalize):
     def __init__(self, vmin, vmax, midpoint=None, clip=False):
@@ -1396,7 +1436,7 @@ class MidpointNormalize(matplotlib.colors.Normalize):
         x, y = [self.vmin, self.midpoint, self.vmax], [0, 0.5, 1]
         return np.ma.masked_array(np.interp(value, x, y))
 
-
+# A custom colour map.
 cdict = {'red':   [[0.0,  1.0, 1.0],
                    #[0.5,  0.25, 0.25],
                    [0.5, 0.6, 0.6],
@@ -1408,22 +1448,11 @@ cdict = {'red':   [[0.0,  1.0, 1.0],
          'blue':  [[0.0,  0.0, 0.0],
                    #[0.5,  1.0, 1.0],
                    [0.5, 0.0, 0.0],
-                   [1.0,  0.0, 0.0]]}
-                   
-custom_cbar = matplotlib.colors.LinearSegmentedColormap('custom_cbar', segmentdata=cdict)
+                   [1.0,  0.0, 0.0]]}                
+custom_cmap = matplotlib.colors.LinearSegmentedColormap('custom_cmap', segmentdata=cdict)
 
-# cdict = {'red':   [[0.0,  0.0, 0.0],
-#                    [1.0,  1.0, 1.0]],
-#          'green': [[0.0,  0.0, 0.0],
-#                    [1.0,  0.0, 0.0]],
-#          'blue':  [[0.0,  0.0, 0.0],
-#                    [1.0,  0.0, 0.0]]}
-# BkRd = matplotlib.colors.LinearSegmentedColormap('BkRd', segmentdata=cdict)
-
-# cdict = {'red':   [[0.0,  0.0, 0.0],
-#                    [1.0,  0.0, 0.0]],
-#          'green': [[0.0,  0.0, 0.0],
-#                    [1.0,  0.0, 0.0]],
-#          'blue':  [[0.0,  0.0, 0.0],
-#                    [1.0,  1.0, 1.0]]}
-# BkBu = matplotlib.colors.LinearSegmentedColormap('BkBu', segmentdata=cdict)
+# Fast way to calculate running mean.
+# From https://stackoverflow.com/a/27681394
+def running_mean(x, N):
+    cumsum = np.cumsum(np.insert(x, 0, 0)) 
+    return (cumsum[N:] - cumsum[:-N]) / float(N)
