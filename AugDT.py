@@ -7,6 +7,7 @@ import numpy as np
 import math
 import pandas as pd
 pd.options.mode.chained_assignment = None
+from scipy.spatial import minkowski_distance
 from tqdm import tqdm
 import matplotlib
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
@@ -26,8 +27,7 @@ class AugDT:
         if type(scale_features_by) != str:
             assert len(scale_features_by) == self.num_features
             self.scale_features_by = 'given'
-            # NOTE: Normalising using geometric mean.
-            self.feature_scales = np.array(scale_features_by) / np.exp(np.mean(np.log(scale_features_by)))
+            self.feature_scales = np.array(scale_features_by)
         else: 
             self.scale_features_by = scale_features_by
             self.feature_scales = []
@@ -35,6 +35,7 @@ class AugDT:
         self.gamma = gamma
         self.tree = None
         self.cf = None 
+        self.have_highlights = False
         self.have_df = False 
 
 
@@ -46,16 +47,16 @@ class AugDT:
     # TODO: Master grow() method to prevent duplications.
 
     def grow_depth_first(self, 
-                         o, a, r=[], p=[], n=[], w=[],         # Dataset.
-                         split_by =                  'action', # Attribute to split by: action, value or both.
-                         gain_relative_to =          'root',   # Whether to normalise gains relative to parent or root.
-                         value_weight =              0,        # Weight of value impurity (if by = 'weighted').
-                         max_depth =                 np.inf,   # Depth at which to stop splitting.  
-                         min_samples_split =         2,        # Min samples at a node to consider splitting. 
-                         min_weight_fraction_split = 0,        # Min weight fraction at a node to consider splitting.
-                         min_samples_leaf =          1,        # Min samples at a leaf to accept split.
-                         min_split_quality =         0,        # Min relative impurity gain to accept split.
-                         stochastic_splits =         False,    # Whether to samples splits proportional to impurity gain. Otherwise deterministic argmax.
+                         o, a, r=[], p=[], n=[], w=[],           # Dataset.
+                         split_by =                  'weighted', # Attribute to split by: action, value or both.
+                         gain_relative_to =          'root',     # Whether to normalise gains relative to parent or root.
+                         value_weight =              0,          # Weight of value impurity (if by = 'weighted').
+                         max_depth =                 np.inf,     # Depth at which to stop splitting.  
+                         min_samples_split =         2,          # Min samples at a node to consider splitting. 
+                         min_weight_fraction_split = 0,          # Min weight fraction at a node to consider splitting.
+                         min_samples_leaf =          1,          # Min samples at a leaf to accept split.
+                         min_split_quality =         0,          # Min relative impurity gain to accept split.
+                         stochastic_splits =         False,      # Whether to samples splits proportional to impurity gain. Otherwise deterministic argmax.
                          ):
         """
         Accept a complete dataset and grow a complete tree depth-first as in CART.
@@ -88,16 +89,16 @@ class AugDT:
 
     
     def grow_best_first(self, 
-                        o, a, r=[], p=[], n=[], w=[],         # Dataset.
-                        split_by =                  'action', # Attribute to split by: action, value or both.
-                        gain_relative_to =          'root',   # Whether to normalise gains relative to parent or root.
-                        value_weight =              0.5,      # Weight of value impurity (if by='weighted').
-                        max_num_leaves =            np.inf,   #
-                        min_samples_split =         2,        #
-                        min_weight_fraction_split = 0,        # Min weight fraction at a node to consider splitting.
-                        min_samples_leaf =          1,        # Min samples at a leaf to accept split.
-                        min_split_quality =         0,        # Min relative impurity gain to accept split.
-                        stochastic_splits =         False,    # Whether to samples splits proportional to impurity gain. Otherwise deterministic argmax.
+                        o, a, r=[], p=[], n=[], w=[],           # Dataset.
+                        split_by =                  'weighted', # Attribute to split by: action, value or both.
+                        gain_relative_to =          'root',     # Whether to normalise gains relative to parent or root.
+                        value_weight =              0.5,        # Weight of value impurity (if by='weighted').
+                        max_num_leaves =            np.inf,     #
+                        min_samples_split =         2,          #
+                        min_weight_fraction_split = 0,          # Min weight fraction at a node to consider splitting.
+                        min_samples_leaf =          1,          # Min samples at a leaf to accept split.
+                        min_split_quality =         0,          # Min relative impurity gain to accept split.
+                        stochastic_splits =         False,      # Whether to samples splits proportional to impurity gain. Otherwise deterministic argmax.
                         ):
         """
         Accept a complete dataset and grow a complete tree best-first.
@@ -220,10 +221,8 @@ class AugDT:
             elif self.scale_features_by == 'percentiles':
                 ranges = (np.percentile(self.o, 95, axis=0) - np.percentile(self.o, 5, axis=0))
             else: raise ValueError('Invalid feature scaling method.')
-            inverse_ranges = 1 / ranges
-            # NOTE: Normalising using geometric mean.
-            self.feature_scales = inverse_ranges / np.exp(np.mean(np.log(inverse_ranges)))
-
+            self.feature_scales = 1 / ranges
+            
 
     def action_loss_to_matrix(self):
         """Convert dictionary representation to a matrix for use in action_impurity calculations."""
@@ -284,8 +283,10 @@ class AugDT:
         else: node.value_mean = 0; node.value_impurity = 0        
         # Placeholder for counterfactual samples and criticality.
         node.cf_indices = []
-        node.criticality_mean = np.nan
-        node.criticality_impurity = np.nan
+        # NOTE: Initialising criticalities at zero.
+        # This has an effect on both visualisation and HIGHLIGHTS in the case of leaves
+        # where no counterfactual data ends up.
+        node.criticality_mean = 0; node.criticality_impurity = 0
         return node
 
 
@@ -874,17 +875,13 @@ class AugDT:
         assert self.tree != None, 'Must have already grown tree.'
         assert len(o) == len(a) == len(r) == len(p) == len(n), 'All inputs must be the same length.'
         if self.cf == None: self.cf = counterfactual()
-
         # Convert actions into indices.
         if self.classifier: a = np.array([self.action_names.index(c) for c in a]) 
-        
         # Compute return for each new sample.
         g = self.compute_returns(r, p, n)
-
         # Use the extant tree to get an address for each sample, and predict its value under the target policy.
         R = self.predict(o, attributes=['address','value'])       
         addresses = R['address']; v_t = R['value']
-
         # Store the counterfactual data, appending if applicable.
         num_samples_prev = self.cf.num_samples
         if append == False or num_samples_prev == 0:
@@ -901,10 +898,8 @@ class AugDT:
             self.cf.v_t = np.hstack((self.cf.g, v_t))
             self.cf.regret = np.hstack((self.cf.regret, np.empty_like(g))) # Empty; compute below.
             self.cf.num_samples += len(o)
-
         # Compute regret for each new sample. 
         self.cf_compute_regret(regret_steps, num_samples_prev)
-
         # Store new samples at nodes by back-propagating.
         samples_per_leaf = {addr:[] for addr in set(addresses)}
         for index, addr in zip(np.arange(num_samples_prev, self.cf.num_samples), addresses):
@@ -914,9 +909,10 @@ class AugDT:
             while address != ():
                 ancestor, address = self.parent(address)
                 ancestor.cf_indices += indices
-
         # (Re)compute criticality for all nodes in the tree.
         self.cf_compute_node_criticalities()
+        # Finally, use the leaves to estimate criticality for every sample in the training dataset.
+        self.c = self.predict(self.o, attributes=['criticality'])
 
 
     def cf_compute_regret(self, steps, start_index=0):
@@ -977,23 +973,75 @@ class AugDT:
         recurse(self.tree)
 
 
-    def highlights(self, window=10):
+    def init_highlights(self, crit_smoothing=5, max_length=np.inf):
         """
-        HIGHLIGHTS algorithm (Amir et al, AAMAS 2018).
+        Precompute all the data required for our interpretation 
+        of the HIGHLIGHTS algorithm (Amir et al, AAMAS 2018).
         """
         assert self.tree != None and self.cf != None and self.cf.num_samples > 0, 'Must have tree and counterfactual data.'
-        # Split samples into episodes
-        ep_indices = self.split_into_episodes(self.p, self.n)
-        # Use the extant tree to get a criticality time series for each episode. 
-        ep_criticality = [self.predict(self.o[ep], attributes=['criticality'])
-                               for ep in ep_indices]
-        # Smooth the time series.
-        ep_criticality_smoothed = [running_mean(crit, window) for crit in ep_criticality]
-        # Order the episodes by their total (smoothed) criticality.
-        ep_criticality_sums = np.argsort([np.nansum(crit) for crit in ep_criticality_smoothed])[::-1]
-
-        return [ep_criticality_smoothed[ep] for ep in ep_criticality_sums]
-
+        smooth_window = (2 * crit_smoothing) + 1
+        ep_obs, ep_crit, all_crit, all_timesteps = [], [], [], []
+        # Split the training data into episodes and iterate through.
+        for ep, indices in enumerate(self.split_into_episodes(self.p, self.n)):
+            # Construct an observation time series for this episode.
+            ep_obs.append(self.o[indices])
+            # Temporally smooth the criticality time series for this episode.
+            crit = running_mean(self.c[indices], smooth_window)
+            ep_crit.append(crit)
+            # Store 'unravelled' criticality and timestep indices so can sort globally.
+            all_crit += list(crit)
+            all_timesteps += [(ep, t) for t in range(len(indices))]            
+        # Sort timesteps (across all episodes) by smoothed criticality.
+        all_timesteps_sorted = [t for _,t in sorted(zip(all_crit, all_timesteps))]
+        # Now iterate through the sorted timesteps and construct highlights in order of criticality.
+        self.highlights_obs, self.highlights_crit, used = [], [], []
+        if max_length != np.inf: max_length = max_length // 2
+        while all_timesteps_sorted != []:
+            # Pop the most critical timestep off all_timesteps_sorted.
+            timestep = all_timesteps_sorted.pop()
+            if timestep not in used: # If hasn't been used in a previous highlight.
+                ep, t = timestep
+                # Assemble a list of timesteps either side.
+                trajectory = np.arange(max(0, t-max_length), min(len(ep_obs[ep]), t+max_length))
+                # Store this highlight and its smoothed criticality time series.
+                self.highlights_obs.append(ep_obs[ep][trajectory])
+                self.highlights_crit.append(ep_crit[ep][trajectory])
+                # Record all these timesteps as used.
+                used += [(ep, tt) for tt in trajectory]
+        self.have_highlights = True 
+        
+        
+    def top_highlights(self, k=1, diversity=0.1, p=2): 
+        """
+        Assuming init_highlights has already been run, return the k best highlights.
+        """
+        assert self.have_highlights, 'Must run init_highlights first.'
+        assert diversity >= 0 and diversity <= 1, 'Diversity must be in [0,1].'
+        if k > 1:
+            # Calculate the distance between the opposite corners of the global feature lims box.
+            # This is used for normalisation.
+            dist_norm = minkowski_distance(self.global_feature_lims[:,0] * self.feature_scales,
+                                            self.global_feature_lims[:,1] * self.feature_scales, p=p)
+        chosen_highlights_obs, chosen_highlights_crit, i, n = [], [], -1, 0
+        while n < k: 
+            i += 1
+            if diversity > 0 and n > 0:
+                # Find the feature-scaled Frechet distance to each existing highlight and normalise.
+                dist_to_others = np.array([scaled_frechet_dist(self.highlights_obs[i],
+                                                               chosen_highlights_obs[j],
+                                                               self.feature_scales, p=p)
+                                           for j in range(n)]) / dist_norm                
+                
+                print(i, n, min(dist_to_others), max(dist_to_others))
+                
+                assert max(dist_to_others) <= 1, 'Error: Scaled-and-normalised Frechet distance should always be <= 1!'
+                # Ignore this highlight if the smallest Frechet distance is below a threshold.
+                if min(dist_to_others) < diversity: continue
+            # Store this highlight.
+            chosen_highlights_obs.append(self.highlights_obs[i])
+            chosen_highlights_crit.append(self.highlights_crit[i])
+            n += 1
+        return chosen_highlights_obs, chosen_highlights_crit
 
 
 # ===================================================================================================================
@@ -1061,8 +1109,9 @@ class AugDT:
             weight_sum = sum(self.w[node.indices])
             data['weight_sum'].append(weight_sum)
             data['weight_fraction'].append(weight_sum / self.w_sum)
-            #    (Volume of a leaf = product of feature ranges, scaled by self.feature_scales)
-            volume = np.prod((ranges[:,1] - ranges[:,0]) * self.feature_scales)
+            # Volume and density information.
+            #   Volume of a leaf = product of feature ranges, scaled by feature_scales_norm.
+            volume = np.prod((ranges[:,1] - ranges[:,0]) * feature_scales_norm)
             data['volume'].append(volume)
             data['sample_density'].append(node.num_samples / volume)
             data['weight_density'].append(weight_sum / volume)
@@ -1099,6 +1148,9 @@ class AugDT:
         #    Criticality information.
         keys += ['criticality','criticality_impurity']
         data = {k:[] for k in keys}
+        # NOTE: For volume calculations, normalise feature scales by geometric mean.
+        # This tends to keep hyperrectangle volumes reasonable.   
+        feature_scales_norm = self.feature_scales / np.exp(np.mean(np.log(self.feature_scales)))
         # Populate dictionary by recursion through the tree.
         recurse(self.tree)        
         # Convert into dataframe.
@@ -1142,20 +1194,20 @@ class AugDT:
             return df
 
     
-    def visualise(self, features, attributes=[None], lims=[], 
+    def treemap(self, features, attributes=[None], lims=[], 
                   visualise=True, axes=[],
                   action_colours=None, cmap_percentiles=[5,95], cmap_midpoints=[], density_percentile=90,
                   alpha_by_density=False, edge_colour=None, show_addresses=False, try_reuse_df=True):
         """
-        Visualise attributes across one or two features, 
-        possibly marginalising across all others.
+        Create a treemap visualisation across one or two features, 
+        possibly projecting across all others.
         """
         if type(features) in (str, int): features = [features]
-        n = len(features)
-        assert n in (1,2), 'Can only plot in 1 or 2 dimensions.'
+        n_f = len(features)
+        assert n_f in (1,2), 'Can only plot in 1 or 2 dimensions.'
         if not(try_reuse_df and self.have_df): df = self.to_dataframe()
         df = self.df.loc[self.df['kind']=='leaf'] # Only care about leaves.
-        if lims == []: lims = [[None,None]] * n
+        if lims == []: lims = [[None,None]] * n_f
         # For any lim that = None, replace with the global min or max.
         lims = np.array(lims).astype(float)
         fi = [self.feature_names.index(f) for f in features]
@@ -1171,6 +1223,7 @@ class AugDT:
                  None:None
                  }
         if type(attributes) == str: attributes = [attributes]
+        n_a = len(attributes)
         for attr in attributes: 
             assert attr in cmaps, 'Invalid attribute.'
         # If doing alpha_by_density, need to evaluate sample_density even if not requested.
@@ -1180,12 +1233,12 @@ class AugDT:
         if cmap_midpoints == []: 
             # If cmap midpoints not specified, use defaults.
             cmap_midpoints = [None for f in attributes]   
-        if n < self.num_features: marginalise = True
+        if n_f < self.num_features: marginalise = True
         else: marginalise = False
         regions = {}                  
         if not marginalise:
             # This is easy: can just use leaves directly.
-            if n == 1: height = 1
+            if n_f == 1: height = 1
             for address, leaf in df.iterrows():
                 xy = []; outside_lims = False
                 for i, (f, lim) in enumerate(zip(features, lims)):
@@ -1199,7 +1252,7 @@ class AugDT:
                     if i == 0: width = f_max - f_min 
                     else:      height = f_max - f_min 
                 if outside_lims: continue
-                if n == 1: xy.append(0)
+                if n_f == 1: xy.append(0)
                 regions[address] = {'xy':xy, 'width':width, 'height':height, 'alpha':1}  
                 for attr in attributes_plus: 
                     if attr != None: regions[address][attr] = leaf[attr]   
@@ -1208,7 +1261,7 @@ class AugDT:
             f1 = features[0]
             p1 = np.unique(df[[f1+' >',f1+' <']].values) # Sorted by default.
             r1 = np.vstack((p1[:-1],p1[1:])).T # Ranges.
-            if n == 2: 
+            if n_f == 2: 
                 f2 = features[1]
                 p2 = np.unique(df[[f2+' >',f2+' <']].values) 
                 r2 = np.vstack((p2[:-1],p2[1:])).T
@@ -1219,7 +1272,7 @@ class AugDT:
                 max1 = min(max1, lims[0][1])
                 width = max1 - min1
                 feature_ranges = {features[0]: [min1, max1]}
-                if n == 1: 
+                if n_f == 1: 
                     xy = [min1, 0]
                     height = 1
                 else: 
@@ -1229,36 +1282,36 @@ class AugDT:
                     feature_ranges[features[1]] = [min2, max2]
                     xy = [min1, min2]
                     height = max2 - min2   
-                # Find "core": the leaves that overlap with the feature range(s).
-                core = self.df_filter(df, features=feature_ranges)
-                regions[m] = {'xy':xy, 'width':width, 'height':height, 'alpha':1}             
-                for attr in attributes_plus:
-                    if attr == None: pass
-                    elif attr == 'action' and self.classifier:
-                        # Special case for action with classification: discrete values.
-                        regions[m][attr] = np.argmax(np.dot(np.vstack(core['weighted_action_counts'].values).T, 
-                                                                      core['overlap'].values.reshape(-1,1)))
-                    else: 
-                        if attr in ('sample_density','weight_density'): normaliser = 'volume' # Another special case for densities.
-                        else:                                           normaliser = 'weight_sum'
-                        # Take contribution-weighted mean across the core.
-                        norm_sum = np.dot(core[normaliser].values, core['overlap'].values)
-                        # NOTE: Averaging process assumes uniform data distribution within leaves.
-                        core['contrib'] = core.apply(lambda row: (row[normaliser] * row['overlap']) / norm_sum, axis=1)
-                        regions[m][attr] = np.nansum(core[attr].values * core['contrib'].values)          
+                regions[m] = {'xy':xy, 'width':width, 'height':height, 'alpha':1}  
+                if attributes != [None]:           
+                    # Find "core": the leaves that overlap with the feature range(s).
+                    core = self.df_filter(df, features=feature_ranges)
+                    for attr in attributes_plus:
+                        if attr == None: pass
+                        elif attr == 'action' and self.classifier:
+                            # Special case for action with classification: discrete values.
+                            regions[m][attr] = np.argmax(np.dot(np.vstack(core['weighted_action_counts'].values).T, 
+                                                                        core['overlap'].values.reshape(-1,1)))
+                        else: 
+                            if attr in ('sample_density','weight_density'): normaliser = 'volume' # Another special case for densities.
+                            else:                                           normaliser = 'weight_sum'
+                            # Take contribution-weighted mean across the core.
+                            norm_sum = np.dot(core[normaliser].values, core['overlap'].values)
+                            # NOTE: Averaging process assumes uniform data distribution within leaves.
+                            core['contrib'] = core.apply(lambda row: (row[normaliser] * row['overlap']) / norm_sum, axis=1)
+                            regions[m][attr] = np.nansum(core[attr].values * core['contrib'].values)          
         if visualise:
-            if n == 1:
+            if n_f == 1:
                 if axes != []: ax = axes
-                else: _, ax = matplotlib.pyplot.subplots()
+                else: _, ax = matplotlib.pyplot.subplots(); axes = ax
                 ax.set_xlabel(features[0]); ax.set_xlim(lims[0])
-                ax.set_yticks(np.arange(len(attributes))+0.5)
+                ax.set_yticks(np.arange(n_a)+0.5)
                 ax.set_yticklabels(attributes)
-                ax.set_ylim([0,max(1,len(attributes))])
-                ax.add_patch(matplotlib.patches.Rectangle(xy=[lims[0][0],0], width=lims[0][1]-lims[0][0], height=len(attributes), 
+                ax.set_ylim([0,max(1,n_a)])
+                ax.add_patch(matplotlib.patches.Rectangle(xy=[lims[0][0],0], width=lims[0][1]-lims[0][0], height=n_a, 
                                            facecolor='k', hatch=None, edgecolor=None, zorder=-11))
             else:
                 offset = np.array([0,0])
-
             # If doing alpha_by_density, precompute alpha values.
             if alpha_by_density:
                 density_list = [r['sample_density'] for r in regions.values()]
@@ -1267,15 +1320,13 @@ class AugDT:
                 alpha_norm = matplotlib.colors.LogNorm(vmin=amin, vmax=amax)
                 for m, region in regions.items():
                     regions[m]['alpha'] = min(alpha_norm(region['sample_density']), 1)
-            
             for a, attr in enumerate(attributes):
-                if n == 1:
+                if n_f == 1:
                     offset = np.array([0,a])
                 else:
-                    if axes != []: 
-                        if len(attributes) == 1: ax = axes
-                        else: ax = axes[a]
-                    else: _, ax = matplotlib.pyplot.subplots()
+                    if len(axes) <= a: 
+                        axes.append(matplotlib.pyplot.subplots()[1])
+                    ax = axes[a]
                     ax.set_title(attr)
                     ax.set_xlabel(features[0]); ax.set_xlim(lims[0])
                     ax.set_ylabel(features[1]); ax.set_ylim(lims[1])    
@@ -1304,12 +1355,12 @@ class AugDT:
                         colour_norm = MidpointNormalize(vmin=vmin, vmax=vmax, midpoint=vmid)
                     dummy = ax.imshow(np.array([[vmin,vmax]]), aspect='auto', cmap=cmaps[attr], norm=colour_norm)
                     dummy.set_visible(False)
-                    if n == 1:
+                    if n_f == 1:
                         axins = inset_axes(ax,
                                            width='3%',  
-                                           height=f'{(100/len(attributes))-1}%',  
+                                           height=f'{(100/n_a)-1}%',  
                                            loc='lower left',
-                                           bbox_to_anchor=(1.01, a/len(attributes), 1, 1),
+                                           bbox_to_anchor=(1.01, a/n_a, 1, 1),
                                            bbox_transform=ax.transAxes,
                                            borderpad=0,
                                            )
@@ -1329,18 +1380,18 @@ class AugDT:
                     if not marginalise and show_addresses: 
                         ax.text(region['xy'][0]+region['width']/2, region['xy'][1]+region['height']/2, m, 
                                 horizontalalignment='center', verticalalignment='center')
+            # Some quick margin adjustments.
             matplotlib.pyplot.tight_layout()
-            if n == 1: matplotlib.pyplot.subplots_adjust(right=0.85)
-        return regions
+            if n_f == 1: matplotlib.pyplot.subplots_adjust(right=0.85)
+            elif n_a == 1: axes = axes[0]
+        return regions, axes
 
 
-    def plot_path_2D(self, path, features, ax=None, colour='k', alpha=1, try_reuse_df=True):
+    def plot_transitions_2D(self, path, features, ax=None, colour='k', alpha=1, try_reuse_df=True):
         """
-        Given a path between leaves, plot on the specified feature axes.
+        Given a sequence of transitions between leaves, plot on the specified feature axes.
         """
         if type(features) in (str, int): features = [features]
-        n = len(features)
-        assert n == 2, 'Can only plot in 2 dimensions.'
         if not(try_reuse_df and self.have_df): df = self.to_dataframe()
         df = self.df.loc[self.df['kind']=='leaf'] # Only care about leaves.
         pts = []
@@ -1350,12 +1401,25 @@ class AugDT:
             for f in features:
                 lims = leaf[[f+' >',f+' <']].values[0]
                 pt.append(lims[0] + ((lims[1] - lims[0]) / 2))
-            #matplotlib.pyplot.text(pt[0], pt[1], address, horizontalalignment='center', verticalalignment='center')
             pts.append(pt)
-        pts = np.array(pts).T
-        matplotlib.pyplot.plot(pts[0], pts[1], colour, alpha=alpha)
-        matplotlib.pyplot.scatter(pts[0,0], pts[1,0], c='y', alpha=alpha, zorder=10)
-        matplotlib.pyplot.scatter(pts[0,-1], pts[1,-1], c='k', alpha=alpha, zorder=10)        
+        return self.plot_trajectory_2D(pts, ax, colour, alpha)
+
+
+    def plot_trajectory_2D(self, pts, features=[], ax=None, colour='k', alpha=1):
+        """
+        xxx
+        """
+        pts = np.array(pts)
+        n_f = pts.shape[1]
+        if n_f != 2:
+            assert n_f == self.num_features, 'Data shape must match num_features.'
+            assert len(features) == 2, 'Need to specify two features for projection.'
+            # This allows plotting of a projected path onto two specified features.
+            pts = pts[:,[self.feature_names.index(f) for f in features]]   
+        if ax == None: _, ax = matplotlib.pyplot.subplots()
+        ax.plot(pts[:,0], pts[:,1], colour, alpha=alpha)
+        ax.scatter(pts[0,0], pts[0,1], c='y', alpha=alpha, zorder=10)
+        ax.scatter(pts[-1,0], pts[-1,1], c='k', alpha=alpha, zorder=10)
         return pts
 
 
@@ -1438,21 +1502,40 @@ class MidpointNormalize(matplotlib.colors.Normalize):
 
 # A custom colour map.
 cdict = {'red':   [[0.0,  1.0, 1.0],
-                   #[0.5,  0.25, 0.25],
-                   [0.5, 0.6, 0.6],
+                   [0.5,  0.25, 0.25],
+                   #[0.5, 0.6, 0.6],
                    [1.0,  0.0, 0.0]],
          'green': [[0.0,  0.0, 0.0],
-                   #[0.5,  0.25, 0.25],
-                   [0.5, 0.4, 0.4],
+                   [0.5,  0.25, 0.25],
+                   #[0.5, 0.4, 0.4],
                    [1.0,  0.8, 0.8]],
          'blue':  [[0.0,  0.0, 0.0],
-                   #[0.5,  1.0, 1.0],
-                   [0.5, 0.0, 0.0],
+                   [0.5,  1.0, 1.0],
+                   #[0.5, 0.0, 0.0],
                    [1.0,  0.0, 0.0]]}                
 custom_cmap = matplotlib.colors.LinearSegmentedColormap('custom_cmap', segmentdata=cdict)
 
 # Fast way to calculate running mean.
-# From https://stackoverflow.com/a/27681394
+# From https://stackoverflow.com/a/43200476
+import scipy.ndimage.filters as ndif
 def running_mean(x, N):
-    cumsum = np.cumsum(np.insert(x, 0, 0)) 
-    return (cumsum[N:] - cumsum[:-N]) / float(N)
+    x = np.pad(x, N // 2, mode='constant', constant_values=(x[0],x[-1]))
+    return ndif.uniform_filter1d(x, N, mode='constant', origin=-(N//2))[:-(N-1)]
+
+# Frechet distance computation with scaled dimensions.
+# Slightly changed from https://github.com/cjekel/similarity_measures/blob/master/similaritymeasures/similaritymeasures.py.
+def scaled_frechet_dist(X, Y, scales, p):    
+    X = X * scales
+    Y = Y * scales
+    n, m = len(X), len(Y)
+    ca = np.multiply(np.ones((n, m)), -1)
+    ca[0, 0] = minkowski_distance(X[0], Y[0], p=p)
+    for i in range(1, n):
+        ca[i, 0] = max(ca[i-1, 0], minkowski_distance(X[i], Y[0], p=p))
+    for j in range(1, m):
+        ca[0, j] = max(ca[0, j-1], minkowski_distance(X[0], Y[j], p=p))
+    for i in range(1, n):
+        for j in range(1, m):
+            ca[i, j] = max(min(ca[i-1, j], ca[i, j-1], ca[i-1, j-1]),
+                           minkowski_distance(X[i], Y[j], p=p))
+    return ca[n-1, m-1]
