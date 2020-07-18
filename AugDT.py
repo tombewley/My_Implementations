@@ -14,11 +14,12 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 class AugDT:
     def __init__(self,
-                 classifier,                       # Whether actions are discrete or continuous.
-                 feature_names = None,             # Assign alphanumeric names to features.
-                 scale_features_by = 'range',      # Method used to determine feature scaling, or pre-computed vector of scales.
-                 pairwise_action_loss =      {},   # (For classification) badness of each pairwise action error. If unspecified, assume uniform.
-                 gamma =                     1     # Discount factor to use when considering reward.
+                 classifier,                   # Whether actions are discrete or continuous.
+                 feature_names = None,         # Assign alphanumeric names to features.
+                 scale_features_by = 'range',  # Method used to determine feature scaling, or pre-computed vector of scales.
+                 scale_derivatives_by = 'std', # Method used to determine derivative scaling.
+                 pairwise_action_loss = {},    # (For classification) badness of each pairwise action error. If unspecified, assume uniform.
+                 gamma = 1                     # Discount factor to use when considering reward.
                  ):   
         self.classifier = classifier
         if feature_names: self.feature_names = feature_names
@@ -27,10 +28,14 @@ class AugDT:
         if type(scale_features_by) != str:
             assert len(scale_features_by) == self.num_features
             self.scale_features_by = 'given'
-            self.feature_scales = np.array(scale_features_by)
+            self.feature_scales = np.array(scale_features_by) 
         else: 
             self.scale_features_by = scale_features_by
             self.feature_scales = []
+        assert scale_derivatives_by == 'std', 'Only standard deviation implemented.'
+        self.scale_derivatives_by = scale_derivatives_by
+        self.derivative_scales = []
+        self.min_samples_split = 2; self.min_samples_leaf = 1
         self.pairwise_action_loss = pairwise_action_loss
         self.gamma = gamma
         self.tree = None
@@ -76,15 +81,18 @@ class AugDT:
         self.min_weight_fraction_split = min_weight_fraction_split
         self.stochastic_splits = stochastic_splits
         self.min_split_quality = min_split_quality
-        self.load_data(o, a, r, p, n, w, append=False)
+        self.load_data(o, a, r, p, n, w)
         self.seed()
         def recurse(node, depth):
             if depth < self.max_depth and self.split(node):
-                self.num_leaves += 1
                 recurse(node.left, depth+1)
                 recurse(node.right, depth+1)
+        print('Growing...')
         recurse(self.tree, 0)
-        # Compute leaf transition probabilities.
+        # List all the leaf integers.
+        self.leaf_nints = self.get_leaf_nints()
+        # Compute leaf transition probabilities, both marginal and conditional.
+        print('Computing transition probabilities...')
         self.compute_all_leaf_transition_probs()
 
     
@@ -119,14 +127,19 @@ class AugDT:
         self.min_samples_leaf = min_samples_leaf
         self.stochastic_splits = stochastic_splits
         self.min_split_quality = min_split_quality
-        self.load_data(o, a, r, p, n, w, append=False)
+        self.load_data(o, a, r, p, n, w)
         self.seed()
-        self.untried_leaf_addresses = [()]
+        self.untried_leaf_nints = [1]
         self.leaf_impurities = [[self.tree.action_impurity_sum, self.tree.value_impurity_sum]]
+        print('Growing...')
         with tqdm(total=self.max_num_leaves) as pbar:
-            while self.num_leaves < self.max_num_leaves and len(self.untried_leaf_addresses) > 0:
+            pbar.update(1)
+            while self.num_leaves < self.max_num_leaves and len(self.untried_leaf_nints) > 0:
                 self.split_next_best(pbar)
-        # Compute leaf transition probabilities.
+        # List all the leaf integers.
+        self.leaf_nints = self.get_leaf_nints()
+        # Compute leaf transition probabilities, both marginal and conditional.
+        print('Computing transition probabilities...')
         self.compute_all_leaf_transition_probs()
                 
 
@@ -137,26 +150,22 @@ class AugDT:
         assert self.tree, 'Must have started growth process already.'
         if self.leaf_impurities == []: return False
         imp = np.array(self.leaf_impurities)
-        root_imp = np.array([self.tree.action_impurity, self.tree.value_impurity])
+        root_imp = np.array([self.tree.action_impurity_sum, self.tree.value_impurity_sum])
         imp_norm = imp / root_imp
-        # max_imp = imp.max(axis=0)
-        # max_imp[max_imp == 0] = 1 # This line prevents div/0 warning.
-        #imp_norm = imp / max_imp
         if self.split_by == 'action': best = np.argmax(imp_norm[:,0])
         elif self.split_by == 'value': best = np.argmax(imp_norm[:,1])
         # NOTE: For split_by='pick', current approach is to sum normalised impurities and find argmax.
         elif self.split_by == 'pick': best = np.argmax(imp_norm.sum(axis=1))
         # NOTE: For split_by='weighted', take weighted sum instead. 
         elif self.split_by == 'weighted': best = np.argmax(np.inner(imp_norm, self.imp_weights))
-        address = self.untried_leaf_addresses.pop(best)
+        nint = self.untried_leaf_nints.pop(best)
         imp = self.leaf_impurities.pop(best)
-        node = self.node(address)
+        node = self.node(nint)
         if self.split(node):
-            self.num_leaves += 1
             if pbar: pbar.update(1)
-            self.untried_leaf_addresses.append(node.left.address)
+            self.untried_leaf_nints.append(node.left.nint)
             self.leaf_impurities.append([node.left.action_impurity_sum, node.left.value_impurity_sum])
-            self.untried_leaf_addresses.append(node.right.address)
+            self.untried_leaf_nints.append(node.right.nint)
             self.leaf_impurities.append([node.right.action_impurity_sum, node.right.value_impurity_sum])
             return True
         # If can't make a split, recurse to try the next best.
@@ -180,8 +189,8 @@ class AugDT:
         *o = observations.
         *a = actions.
         r = rewards.
-        p = index of preceding sample (negative = start of episode).
-        n = index of successor sample (negative = end of episode).
+        p = index of preceding sample (-1 = start of episode).
+        n = index of successor sample (-1 = end of episode).
         w = sample weight.
         """
         if append: raise Exception('Dataset appending not yet implemented.')
@@ -191,6 +200,7 @@ class AugDT:
         self.num_samples, n_f = self.o.shape
         assert n_f == self.num_features, 'Observation size does not match feature_names.'
         assert self.num_samples == len(a) == len(r) == len(p) == len(n), 'All inputs must be the same length.'
+        assert min(p) == min(n) >= -1, 'Episode start/end must be denoted by index of -1.'
         if w == []: self.w = np.ones(self.num_samples)
         else: self.w = w
         self.w_sum = self.w.sum()
@@ -202,26 +212,38 @@ class AugDT:
             self.a = np.array([self.action_names.index(c) for c in a]) # Convert array into indices.
         else:
             self.a = a
-
         self.global_feature_lims = np.vstack((np.min(self.o, axis=0), np.max(self.o, axis=0))).T
-
+        # Placeholder for storing the leaf at which each sample resides.
+        # NOTE: Additional zero at the end handles episode termination cases.
+        self.nint = np.zeros(self.num_samples+1).astype(int)
+        # Placeholder for storing the next leaf after each sample.
+        self.next_nint = np.zeros(self.num_samples).astype(int)
         # Compute return for each sample.
-        self.g = self.compute_returns(self.r, self.p, self.n)
-
+        self.g = self.get_returns(self.r, self.p, self.n)
+        # Compute time derivatives of features for each sample.
+        self.d = self.get_derivatives(self.o, self.p, self.n)
         # Set up min samples for split / leaf if these were specified as ratios.
         if type(self.min_samples_split) == float: self.min_samples_split_abs = int(np.ceil(self.min_samples_split * self.num_samples))
         else: self.min_samples_split_abs = self.min_samples_split
         if type(self.min_samples_leaf) == float: self.min_samples_leaf_abs = int(np.ceil(self.min_samples_leaf * self.num_samples))
         else: self.min_samples_leaf_abs = self.min_samples_leaf
 
-        # Automatically create feature scaling vector if not provided already.
+        # Automatically create feature scaling vectors if not provided already.
         if self.feature_scales == []:
             if self.scale_features_by == 'range': 
                 ranges = self.global_feature_lims[:,1] - self.global_feature_lims[:,0]
             elif self.scale_features_by == 'percentiles':
                 ranges = (np.percentile(self.o, 95, axis=0) - np.percentile(self.o, 5, axis=0))
             else: raise ValueError('Invalid feature scaling method.')
-            self.feature_scales = 1 / ranges
+            self.feature_scales = max(ranges) / ranges
+        if self.derivative_scales == []:
+            if self.scale_derivatives_by == 'std':
+                ranges = np.nanstd(self.d, axis=0)
+            self.derivative_scales = max(ranges) / ranges
+
+        # Z-normalise feature derivatives. These are used for impurity calculations.
+        self.d_norm = (self.d - np.nanmean(self.d, axis=0)) * self.derivative_scales
+        
             
 
     def action_loss_to_matrix(self):
@@ -249,10 +271,13 @@ class AugDT:
     
     def new_leaf(self, address, indices):
         """Create a new leaf, computing attributes where required."""
-        node = Node(address = tuple(address),
+        nint = bits_to_int(address)
+        node = Node(nint = nint,
                     indices = indices,
                     num_samples = len(indices),
                     )
+        # Store this leaf as the site of each sample.
+        self.nint[indices] = nint
         # Action attributes for classification.
         if self.classifier: 
             # Action counts, unweighted and weighted.
@@ -281,6 +306,15 @@ class AugDT:
             node.value_impurity_sum = var * node.num_samples
             node.value_impurity = math.sqrt(var) # NOTE: Using standard deviation!
         else: node.value_mean = 0; node.value_impurity = 0        
+        # Feature derivative attributes.
+        if self.d != []:
+            node.derivative_mean = np.nanmean(self.d[indices], axis=0)
+            node.d_norm_mean = np.nanmean(self.d_norm[indices], axis=0)
+            var = np.nanvar(self.d_norm[indices], axis=0)
+            node.d_norm_impurity_sum = var * node.num_samples
+            # NOTE: Taking sum of variance in z-normalised derivatives, and using standard deviation!
+            node.d_norm_impurity = math.sqrt(var.sum()) 
+        else: node.d_norm_mean = 0; node.d_norm_impurity = 0 
         # Placeholder for counterfactual samples and criticality.
         node.cf_indices = []
         # NOTE: Initialising criticalities at zero.
@@ -292,7 +326,7 @@ class AugDT:
 
     def split(self, node):
         """
-        Split a leaf node to minimise impurity.
+        Split a leaf node to minimise some measure of impurity.
         """
         assert node.left == None, 'Not a leaf node.'
         # Check whether able to skip consideration of action or value entirely.
@@ -311,7 +345,7 @@ class AugDT:
         # Iterate through features and find best split(s) for each.
         candidate_splits = []
         for f in range(self.num_features):
-            candidate_splits += self.find_best_split_per_feature(
+            candidate_splits += self.split_feature(
             node, f, action_gain_normaliser, value_gain_normaliser, do_action, do_value)
         # If beneficial split found on at least one feature...
         if sum([s[3][0] != None for s in candidate_splits]) > 0: 
@@ -325,8 +359,10 @@ class AugDT:
                 chosen_split = np.argmax(split_quality) # Ties broken by lowest index.       
             # Unpack information for this split and create child leaves.
             node.feature_index, node.split_by, indices_sorted, (node.threshold, split_index, _, _, _) = candidate_splits[chosen_split]  
-            node.left = self.new_leaf(list(node.address)+[0], indices_sorted[:split_index])
-            node.right = self.new_leaf(list(node.address)+[1], indices_sorted[split_index:])        
+            address = int_to_bits(node.nint)
+            node.left = self.new_leaf(list(address)+[0], indices_sorted[:split_index])
+            node.right = self.new_leaf(list(address)+[1], indices_sorted[split_index:])        
+            self.num_leaves += 1
             # Store impurity gains, scaled by node.num_samples, to measure feature importance.
             node.feature_importance = np.zeros((4, self.num_features))
             if do_action:
@@ -338,7 +374,6 @@ class AugDT:
                 node.feature_importance[3,:] = fi_value # Potential.
                 node.feature_importance[1,node.feature_index] = max(fi_value) # Realised.
             # Back-propagate importances to all ancestors.
-            address = node.address
             while address != ():
                 ancestor, address = self.parent(address)
                 ancestor.feature_importance += node.feature_importance
@@ -347,12 +382,12 @@ class AugDT:
 
 
     # TODO: Make variance calculations sensitive to sample weights.
-    def find_best_split_per_feature(self, parent, f, action_gain_normaliser, value_gain_normaliser, do_action, do_value): 
+    def split_feature(self, parent, f, action_gain_normaliser, value_gain_normaliser, do_action, do_value): 
         """
         Find the split(s) along feature f that minimise(s) the impurity of the children.
         Impurity gain could be measured for action or value individually, or as a weighted sum.
         """
-        # Sort this node's subset along selected feature.
+        # Sort this node's indices along selected feature.
         indices_sorted = parent.indices[np.argsort(self.o[parent.indices,f])]
         # Initialise variables that will be iteratively modified.
         if do_action:    
@@ -380,8 +415,6 @@ class AugDT:
         for num_left in range(self.min_samples_leaf_abs, parent.num_samples+1-self.min_samples_leaf_abs):
             i = indices_sorted[num_left-1]
             num_right = parent.num_samples - num_left
-            o_f = self.o[i,f]
-            o_f_next = self.o[indices_sorted[num_left],f]
             
             if do_action:             
                 if self.classifier:
@@ -413,6 +446,8 @@ class AugDT:
                 value_impurity_gain = parent.value_impurity - ((math.sqrt(value_impurity_sum_left*num_left) + math.sqrt(max(0,value_impurity_sum_right)*num_right)) / parent.num_samples)
 
             # Skip if this sample's feature value is the same as the next one.
+            o_f = self.o[i,f]
+            o_f_next = self.o[indices_sorted[num_left],f]
             if o_f == o_f_next: continue
 
             if do_action: action_rel_impurity_gain = action_impurity_gain / action_gain_normaliser
@@ -442,6 +477,335 @@ class AugDT:
         return mu, var_sum
 
 
+    def split_transitions(self, node):
+        """
+        Split a leaf node to minimise transition impurity.
+        """
+        assert node.left == None, 'Not a leaf node.'
+        # Iterate through features and find best split for each.
+        candidate_splits = []
+        for f in range(self.num_features):
+            candidate_splits += self.split_feature_transitions_v1(node, f)
+        # If beneficial split found on at least one feature...
+        if sum([s[3][0] != None for s in candidate_splits]) > 0: 
+            split_quality = [s[3][2] for s in candidate_splits]
+            print(node.nint, node.transition_impurity_sum, 'SPLIT', split_quality)
+            # Deterministically choose the feature with greatest relative impurity gain.
+            chosen_split = np.argmax(split_quality) # Ties broken by lowest index. 
+            # Unpack information for this split and create child leaves.
+            node.feature_index, node.split_by, indices_sorted, (node.threshold, split_index, _) = candidate_splits[chosen_split]  
+            address = int_to_bits(node.nint)
+            node.left = self.new_leaf(list(address)+[0], indices_sorted[:split_index])
+            node.right = self.new_leaf(list(address)+[1], indices_sorted[split_index:])     
+            self.num_leaves += 1
+            # Remove transition information from parent because no longer relevent. 
+            del node.next_nints; del node.next_nint_counts; del node.transition_impurity_sum   
+            return True
+        print(node.nint, 'NO SPLIT')
+        return False
+    # Version 1 = analyse at the level of trajectories,
+    # and factor in new transitions created by the partition itself. 
+    def compute_transition_impurities_v1(self, nints=[]):
+        """
+        Compute the impurity of the transitions from each leaf using the Gini coefficient.
+        Here, only the last sample in each sequence is used.
+        Optionally specify a subset of leaf integers; otherwise will do all.
+        """
+        if nints == []: nints = self.leaf_nints
+        for nint in nints:
+            leaf = self.node(nint)
+            # Filter samples down to those whose successor is *not* in this leaf.
+            last_indices = leaf.indices[np.nonzero(self.nint[self.n[leaf.indices]] != nint)]
+            # Get the count for each next leaf.
+            leaf.next_nints, leaf.next_nint_counts = np.unique(self.nint[self.n[last_indices]], return_counts=True)
+            leaf.next_nints = list(leaf.next_nints)
+            # Compute the Gini impurity of these counts.
+            counts_sum = np.sum(leaf.next_nint_counts)
+            leaf.transition_impurity = 1 - (np.sum(leaf.next_nint_counts**2) / counts_sum**2)
+            leaf.transition_impurity_sum = leaf.transition_impurity * leaf.num_samples 
+
+        # Return the leaf integers, sorted by transition_impurity_sum.
+        return sorted({nint:self.node(nint).transition_impurity_sum for nint in self.leaf_nints}.items(), key = lambda x: x[1]) 
+    def split_feature_transitions_v1(self, parent, f): 
+        """
+        xxx.
+        """
+        # Sort this node's indices along selected feature.
+        indices_sorted = parent.indices[np.argsort(self.o[parent.indices,f])]
+        # Initialise variables that will be iteratively modified.
+        next_nint_counts_left = np.zeros(len(parent.next_nint_counts)+1).astype(int) # Need extra index to account for transition between the children.
+        left_indices = set()
+        next_nint_counts_right = np.append(parent.next_nint_counts.copy(), 0)
+        right_indices = set(indices_sorted)
+        
+        # Iterate through thresholds.
+        best_split = [[f,'transition',indices_sorted,[None,None,0]]]
+        for num_left in range(self.min_samples_leaf_abs, parent.num_samples+1-self.min_samples_leaf_abs):
+            i = indices_sorted[num_left-1]
+            left_indices.add(i)
+            right_indices.remove(i) 
+
+            # Use Boolean tests to see if we have added or removed a transition.
+            p_in_left = self.p[i] in left_indices
+            p_in_right = self.p[i] in right_indices
+            n_in_left = self.n[i] in left_indices
+            n_in_right = self.n[i] in right_indices
+
+            #print()
+            #print(i, self.o[i], self.n[i], self.nint[self.n[i]])
+            #print(p_in_left, p_in_right, n_in_left, n_in_right)
+
+            if p_in_left:
+                if not(n_in_right): next_nint_counts_left[-1] -= 1 # Remove left-to-right transition.
+            else:
+                if n_in_right: next_nint_counts_left[-1] += 1 # Add left-to-right transition.
+            if n_in_left:
+                if not(p_in_right): next_nint_counts_right[-1] -= 1 # Remove right-to-left transition.
+            else:
+                if p_in_right: next_nint_counts_right[-1] += 1 # Add right-to-left transition.
+            #if not(n_in_left):
+                # Transfer external transition from left to right.
+                if not(n_in_right):
+                    next_nint_index = parent.next_nints.index(self.nint[self.n[i]])
+                    next_nint_counts_left[next_nint_index] += 1
+                    next_nint_counts_right[next_nint_index] -= 1
+            
+            # Skip if this sample's feature value is the same as the next one.
+            o_f = self.o[i,f]
+            o_f_next = self.o[indices_sorted[num_left],f]
+            if o_f == o_f_next: continue
+            
+            # Compute gain in impurity sum.
+            # counts_sum_left = np.sum(next_nint_counts_left)
+            # counts_sum_right = np.sum(next_nint_counts_right)
+            # transition_impurity_sum_gain = parent.transition_impurity_sum \
+            #                              - ((counts_sum_left - (np.sum(next_nint_counts_left**2) / counts_sum_left**2)) \
+            #                              + (counts_sum_right - (np.sum(next_nint_counts_right**2) / counts_sum_right**2)))
+            num_right = parent.num_samples - num_left
+            transition_impurity_gain = parent.transition_impurity \
+                                         - (((num_left * (1 - (np.sum(next_nint_counts_left**2) / np.sum(next_nint_counts_left)**2))) \
+                                         + (num_right * (1 - (np.sum(next_nint_counts_right**2) / np.sum(next_nint_counts_right)**2)))) \
+                                         / parent.num_samples)
+
+            # print(parent.next_nint_counts, next_nint_counts_left, next_nint_counts_right, transition_impurity_sum_gain)
+
+            # Check if best split so far.
+            if transition_impurity_gain > best_split[0][3][2]:
+                best_split[0][3] = [(o_f + o_f_next) / 2, num_left, transition_impurity_gain]
+        
+        # print(f, best_split[0][3])
+
+        return best_split
+    # Version 2 = analyse at the level of samples,
+    # and ignore new transitions. This is more conventional classification.
+    def compute_transition_impurities_v2(self, nints=[]): 
+        """
+        Compute the impurity of the transitions from each leaf using the Gini coefficient.
+        Here, every sample in the leaf is used.
+        Optionally specify a subset of leaf integers; otherwise will do all.
+        """
+        if nints == []: nints = self.leaf_nints
+        for nint in nints:
+            leaf = self.node(nint)
+            # Recompute next_nints for all samples in this leaf.
+            first_indices = leaf.indices[np.nonzero(self.nint[self.p[leaf.indices]] != nint)]            
+            for index in first_indices:
+                next_nint, sequence = self.get_next_nint(index)
+                self.next_nint[sequence] = next_nint
+            # Get the count for each next leaf.
+            leaf.next_nints, leaf.next_nint_counts = np.unique(self.next_nint[leaf.indices], return_counts=True)
+            leaf.next_nints = list(leaf.next_nints)
+            # Compute the Gini impurity of these counts.
+            leaf.transition_impurity_sum = leaf.num_samples - (np.sum(leaf.next_nint_counts**2) / leaf.num_samples)
+            leaf.transition_impurity = leaf.transition_impurity_sum / leaf.num_samples 
+
+        # Return the leaf integers, sorted by transition_impurity_sum.
+        return sorted({nint:self.node(nint).transition_impurity_sum for nint in self.leaf_nints}.items(), key = lambda x: x[1]) 
+    def split_feature_transitions_v2(self, parent, f): 
+        """
+        xxx.
+        """
+        # Sort this node's indices along selected feature.
+        indices_sorted = parent.indices[np.argsort(self.o[parent.indices,f])]
+        # Initialise variables that will be iteratively modified.
+        next_nint_counts_left = np.zeros_like(parent.next_nint_counts) # Need extra index to account for transition between the children.
+        next_nint_counts_right = parent.next_nint_counts.copy()
+        
+        # Iterate through thresholds.
+        best_split = [[f,'transition',indices_sorted,[None,None,0]]]
+        for num_left in range(self.min_samples_leaf_abs, parent.num_samples+1-self.min_samples_leaf_abs):
+            i = indices_sorted[num_left-1]
+            num_right = parent.num_samples - num_left
+
+            # Transfer transition from left to right.
+            next_nint_index = parent.next_nints.index(self.next_nint[i])
+            next_nint_counts_left[next_nint_index] += 1
+            next_nint_counts_right[next_nint_index] -= 1
+
+            # Skip if this sample's feature value is the same as the next one.
+            o_f = self.o[i,f]
+            o_f_next = self.o[indices_sorted[num_left],f]
+            if o_f == o_f_next: continue
+            
+            # Compute gain in impurity.
+            transition_impurity_gain = parent.transition_impurity \
+                                         - (((num_left - (np.sum(next_nint_counts_left**2) / num_left)) \
+                                         + (num_right - (np.sum(next_nint_counts_right**2) / num_right))) \
+                                         / parent.num_samples)
+
+            # print(parent.next_nint_counts, (o_f + o_f_next) / 2, next_nint_counts_left, next_nint_counts_right, transition_impurity_sum_gain)
+
+            # Check if best split so far.
+            if transition_impurity_gain > best_split[0][3][2]:
+                best_split[0][3] = [(o_f + o_f_next) / 2, num_left, transition_impurity_gain]
+        
+        # print(f, best_split[0][3])
+
+        return best_split
+    # Version 3 = analyse at the level of trajectories, and ignore new transitions.
+    def compute_transition_impurities_v3(self, nints=[]): 
+        """
+        Compute the impurity of the transitions from each leaf using the Gini coefficient.
+        Here, only the last sample in each sequence is used but we normalise by the total number of samples.
+        Optionally specify a subset of leaf integers; otherwise will do all.
+        """
+        if nints == []: nints = self.leaf_nints
+        for nint in nints:
+            leaf = self.node(nint)
+            # Filter samples down to those whose successor is *not* in this leaf.
+            last_indices = leaf.indices[np.nonzero(self.nint[self.n[leaf.indices]] != nint)]
+            # Get the count for each next leaf.
+            leaf.next_nints, leaf.next_nint_counts = np.unique(self.nint[self.n[last_indices]], return_counts=True)
+            leaf.next_nints = list(leaf.next_nints)
+            # Compute the Gini impurity of these counts.
+            counts_sum = np.sum(leaf.next_nint_counts)
+            leaf.transition_impurity = 1 - (np.sum(leaf.next_nint_counts**2) / counts_sum**2)
+            leaf.transition_impurity_sum = leaf.transition_impurity * leaf.num_samples 
+
+        # Return the leaf integers, sorted by transition_impurity_sum.
+        return sorted({nint:self.node(nint).transition_impurity_sum for nint in self.leaf_nints}.items(), key = lambda x: x[1]) 
+    def split_feature_transitions_v3(self, parent, f): 
+        """
+        xxx.
+        """
+        # Sort this node's indices along selected feature.
+        indices_sorted = parent.indices[np.argsort(self.o[parent.indices,f])]
+        # Initialise variables that will be iteratively modified.
+        next_nint_counts_left = np.zeros_like(parent.next_nint_counts) # Need extra index to account for transition between the children.
+        next_nint_counts_right = parent.next_nint_counts.copy()
+        
+        # Iterate through thresholds.
+        best_split = [[f,'transition',indices_sorted,[None,None,0]]]
+        for num_left in range(self.min_samples_leaf_abs, parent.num_samples+1-self.min_samples_leaf_abs):
+            i = indices_sorted[num_left-1]
+            num_right = parent.num_samples - num_left
+
+            # Transfer transition from left to right.
+            if self.nint[self.n[i]] != parent.nint:
+                next_nint_index = parent.next_nints.index(self.nint[self.n[i]])
+                next_nint_counts_left[next_nint_index] += 1
+                next_nint_counts_right[next_nint_index] -= 1
+
+            # Skip if this sample's feature value is the same as the next one.
+            o_f = self.o[i,f]
+            o_f_next = self.o[indices_sorted[num_left],f]
+            if o_f == o_f_next: continue
+            
+            # Compute gain in impurity.
+            # transition_impurity_gain = parent.transition_impurity \
+            #                              - (((num_left * (1 - (np.sum(next_nint_counts_left**2) / np.sum(next_nint_counts_left)**2))) \
+            #                              + (num_right * (1 - (np.sum(next_nint_counts_right**2) / np.sum(next_nint_counts_right)**2)))) \
+            #                              / parent.num_samples)
+
+            transition_impurity_gain = parent.transition_impurity \
+                                         - (((num_left * (1 - (np.sum(next_nint_counts_left**2) / np.sum(next_nint_counts_left)**2))) \
+                                         + (num_right * (1 - (np.sum(next_nint_counts_right**2) / np.sum(next_nint_counts_right)**2)))) \
+                                         / parent.num_samples)
+
+
+            # print(parent.nint, self.nint[self.n[i]], num_left, num_right)
+            # print(parent.next_nints, parent.next_nint_counts, (o_f + o_f_next) / 2, next_nint_counts_left, next_nint_counts_right, transition_impurity_gain)
+
+            # Check if best split so far.
+            if transition_impurity_gain > best_split[0][3][2]:
+                best_split[0][3] = [(o_f + o_f_next) / 2, num_left, transition_impurity_gain]
+        
+        # print(f, best_split[0][3])
+
+        return best_split
+
+
+    def split_derivatives(self, node):
+        """
+        Split a leaf node to minimise feature derivative impurity.
+        """
+        assert node.left == None, 'Not a leaf node.'
+        # Iterate through features and find best split for each.
+        candidate_splits = []
+        for f in range(self.num_features):
+            candidate_splits += self.split_feature_derivatives(node, f)
+        # If beneficial split found on at least one feature...
+        if sum([s[3][0] != None for s in candidate_splits]) > 0: 
+            split_quality = [s[3][2] for s in candidate_splits]
+            print(node.nint, node.d_norm_impurity, 'SPLIT', split_quality)
+            # Deterministically choose the feature with greatest relative impurity gain.
+            chosen_split = np.argmax(split_quality) # Ties broken by lowest index. 
+            # Unpack information for this split and create child leaves.
+            node.feature_index, node.split_by, indices_sorted, (node.threshold, split_index, _) = candidate_splits[chosen_split]  
+            address = int_to_bits(node.nint)
+            node.left = self.new_leaf(list(address)+[0], indices_sorted[:split_index])
+            node.right = self.new_leaf(list(address)+[1], indices_sorted[split_index:])     
+            self.num_leaves += 1  
+            return True
+        print(node.nint, 'NO SPLIT')
+        return False
+
+    
+    def split_feature_derivatives(self, parent, f):
+        """
+        Find the split(s) along feature f that minimise(s) the derivative impurity of the children.
+        """
+        # Sort this node's indices along selected feature.
+        indices_sorted = parent.indices[np.argsort(self.o[parent.indices,f])]
+        # Initialise variables that will be iteratively modified.
+        d_norm_mean_left = 0.
+        d_norm_impurity_sum_left = 0.
+        d_norm_mean_right = parent.d_norm_mean.copy()
+        d_norm_impurity_sum_right = parent.d_norm_impurity_sum.copy()
+
+        # Iterate through thresholds.
+        best_split = [[f,'derivative',indices_sorted,[None,None,0]]]
+        for num_left in range(self.min_samples_leaf_abs, parent.num_samples+1-self.min_samples_leaf_abs):
+            i = indices_sorted[num_left-1]
+            num_right = parent.num_samples - num_left
+
+            # Skip if derivative not defined for this sample.
+            d_norm = self.d_norm[i]
+            if np.isnan(np.sum(d_norm)): continue
+
+            d_norm_mean_left, d_norm_impurity_sum_left = self.increment_mu_and_var_sum(d_norm_mean_left, d_norm_impurity_sum_left, d_norm, num_left, 1)
+            d_norm_mean_right, d_norm_impurity_sum_right = self.increment_mu_and_var_sum(d_norm_mean_right, d_norm_impurity_sum_right, d_norm, num_right, -1)
+
+            # Skip if this sample's feature value is the same as the next one.
+            o_f = self.o[i,f]
+            o_f_next = self.o[indices_sorted[num_left],f]
+            if o_f == o_f_next: continue
+
+            # Square root turns into standard deviation.
+            d_norm_impurity_gain = parent.d_norm_impurity \
+                                 - ((math.sqrt(d_norm_impurity_sum_left.sum()*num_left) \
+                                 + math.sqrt(max(0,d_norm_impurity_sum_right.sum())*num_right)) 
+                                 / parent.num_samples)
+
+            # print(d_norm, parent.d_norm_impurity_sum, d_norm_impurity_sum_left, d_norm_impurity_sum_right, d_norm_impurity_gain)
+
+            # Check if best split so far.
+            if d_norm_impurity_gain > best_split[0][3][2]:
+                best_split[0][3] = [(o_f + o_f_next) / 2, num_left, d_norm_impurity_gain]
+
+        return best_split
+
+
 # ===================================================================================================================
 # METHODS FOR PRUNING.
 
@@ -459,7 +823,7 @@ class AugDT:
         optionally returning some additional information.
         """
         # Test if just one sample has been provided.
-        shp = np.shape(o)
+        shp = o.shape
         if len(shp)==1: o = [o]
         if type(attributes) == str: attributes = [attributes]
         R = {}
@@ -480,8 +844,8 @@ class AugDT:
                 # Convert to action names if applicable.
                 if self.classifier and use_action_names: R['action'].append(self.action_names[a_i])
                 else: R['action'].append(a_i)
-            if 'address' in attributes: 
-                R['address'].append(leaf.address)
+            if 'nint' in attributes: 
+                R['nint'].append(leaf.nint)
             if 'uncertainty' in attributes: 
                 if self.classifier: R['uncertainty'].append(leaf.action_probs)
                 else: R['uncertainty'].append(leaf.action_impurity)
@@ -498,10 +862,10 @@ class AugDT:
                 R['criticality_impurity'].append(leaf.criticality_impurity)
         # Turn into numpy arrays.
         for attr in attributes:
-            if attr == 'address': R[attr] = np.array(R[attr], dtype=object) # Allows variable length.
-            else: R[attr] = np.array(R[attr]) 
+            #if attr == 'address': R[attr] = np.array(R[attr], dtype=object) # Allows variable length.
+            #else: 
+            R[attr] = np.array(R[attr]) 
         # Clean up what is returned if just one sample or attribute to include.
-        #if len(o) == 1: R = {k:v[0] for k,v in R.items()}
         if len(attributes) == 1: R = R[attributes[0]]
         return R
 
@@ -546,71 +910,41 @@ class AugDT:
 # METHODS FOR TRAVERSING THE TREE GIVEN VARIOUS LOCATORS.
 
 
-    def leaf_addresses(self):
+    def get_leaf_nints(self):
         """
-        List the addresses of all leaves in the tree.
+        List the integers of all leaves in the tree.
         """
         def recurse(node):
             if node.left:
                 return recurse(node.left) + recurse(node.right) 
-            return [node.address]
+            return [node.nint]
         return recurse(self.tree)
 
 
-    def node(self, address):
+    def node(self, identifier):
         """
-        Navigate to a node using its address.
+        Navigate to a node using its address or integer.
         """
-        if address == None: return None
+        if identifier == None: return None
+        elif type(identifier) == int: identifier = int_to_bits(identifier)
         node = self.tree
-        for lr in address:
-            if lr == 0:   assert node.left, 'Invalid address.'; node = node.left
-            elif lr == 1: assert node.right, 'Invalid address.'; node = node.right
-            else: raise ValueError('Invalid adddress.')
+        for lr in identifier:
+            if lr == 0:   assert node.left, 'Invalid identifier.'; node = node.left
+            elif lr == 1: assert node.right, 'Invalid identifier.'; node = node.right
+            else: raise ValueError('Invalid identifier.')
         return node
 
     
     def parent(self, address):
         """
-        Navigate to a node's parent and return it and its address.
+        Navigate to a node's parent and return it and its address (not integer!)
         """
         parent_address = address[:-1]
         return self.node(parent_address), parent_address
-    
-    
-    def locate_sample(self, index):
-        """
-        Return the leaf node at which a sample is stored, and its address.
-        """
-        def recurse(node, index):
-            if node.left and index in node.left.indices: 
-                return recurse(node.left, index)
-            if node.right and index in node.right.indices: 
-                return recurse(node.right, index)
-            return node, node.address
-        return recurse(self.tree, index)
 
 
 # ===================================================================================================================
 # METHODS FOR WORKING WITH DYNAMIC TRAJECTORIES.
-
-
-    def locate_prev_sample(self, index):
-        """
-        Run locate_sample to find the sample before the given one.
-        """ 
-        index_p = self.p[index]
-        if index_p < 0: return -1, (None, None)
-        return index_p, self.locate_sample(index_p)
-    
-    
-    def locate_next_sample(self, index):
-        """
-        Run locate_sample to find the sample after the given one.
-        """ 
-        index_n = self.n[index]
-        if index_n < 0: return -1, (None, None)
-        return index_n, self.locate_sample(index_n)
 
     
     def sample_episode(_, p, n, index):
@@ -621,15 +955,15 @@ class AugDT:
         if p != []:
             while True: 
                 index_p = p[index_p] 
-                if index_p < 0: break # Negative index indicates the start of a episode.
+                if index_p == -1: break # Index = -1 indicates the start of a episode.
                 before.insert(0, index_p)
         after = [index]; index_n = index
         if n != []:
             while True: 
                 index_n = n[index_n] 
-                if index_n < 0: break # Negative index indicates the end of a episode.
+                if index_n == -1: break # Index = -1 indicates the end of a episode.
                 after.append(index_n)
-        return before, after
+        return np.array(before), np.array(after)
 
     
     def split_into_episodes(self, p, n):
@@ -638,10 +972,10 @@ class AugDT:
         split the indices by episode and put in temporal order.
         """
         return [self.sample_episode([], n, index[0])[1] 
-                for index in np.argwhere(p < 0)]
+                for index in np.argwhere(p == -1)]
 
-    
-    def compute_returns(self, r, p, n): 
+            
+    def get_returns(self, r, p, n): 
         """
         Compute returns for a set of samples.
         """
@@ -649,7 +983,7 @@ class AugDT:
         if not (p != [] and n != []): return r
         g = np.zeros_like(r)
         # Find indices of terminal observations.
-        for index in np.argwhere((n < 0) | (np.arange(len(n)) == len(n)-1)): 
+        for index in np.argwhere((n == -1) | (np.arange(len(n)) == len(n)-1)): 
             g[index] = r[index]
             index_p = p[index]
             while index_p >= 0:
@@ -663,7 +997,7 @@ class AugDT:
         Compute returns for an *ordered episode* of samples, 
         with a limit on the number of lookahead steps.
         """
-        if steps == None: return self.compute_returns(r, p, n)
+        if steps == None: return self.get_returns(r, p, n)
         if r == []: return []
         if (not (p != [] and n != [])) or steps == 1: return r
         assert steps > 0, 'Steps must be None or a positive integer.'
@@ -679,187 +1013,216 @@ class AugDT:
         return g
 
     
-    def leaf_transitions(self, address, previous_address=False, next_address=False):
+    def get_derivatives(self, o, p, n):
         """
-        Given a leaf, find all constituent samples whose predecessors are not in this leaf.
+        Compute the time derivatives of observation features for a set of samples.
+        - Use only the next sample (n) because practically interested in what comes after.
+        - Where n = -1 (terminal state), return NaNs.
+        """
+        # if p == [] or n == []: return []
+        # # Assemble the arrays required.
+        # o_p = self.o[p]; o_n = self.o[n]
+        # # Calculate differences to previous and next samples.
+        # nans = np.full_like(o[0], np.nan)
+        # diffs = np.array([[(o[i] - o_p[i]) if p[i] != -1 else nans for i in range(len(o))],
+        #                   [(o_n[i] - o[i]) if n[i] != -1 else nans for i in range(len(o))]])
+        # return np.nanmean(diffs, axis=0)
+        o_n = self.o[n]; nans = np.full_like(o[0], np.nan)
+        return np.array([(o_n[i] - o[i]) if n[i] != -1 else nans for i in range(len(o))])
+
+
+    def get_next_nint(self, index):
+        """
+        Given a sample, find the next leaf encountered in the successor sequence.
+        Also return the sequence of samples upto this time.
+        """
+        nint = self.nint[index]; sequence = [] 
+        while True:
+            sequence.append(index); index = self.n[index]; next_nint = self.nint[index]
+            if next_nint != nint: break
+        return next_nint, sequence
+    
+    
+    def get_leaf_transitions(self, nint):
+        """
+        Given a leaf integer, find all constituent samples whose predecessors are not in this leaf.
         For each of these, step through the sequence of successors until this leaf is departed.
-        Record both the predecessor and successor leaf (or None if terminal).
+        Record both the previous and next leaf (or 0 if terminal).
         """
-        leaf = self.node(address)
+        leaf = self.node(nint)
         assert leaf.left == None and leaf.right == None, 'Node must be a leaf.'
-        if previous_address != False:
-            assert next_address == False
-            # Filter samples down to those whose predecessor is in the previous leaf. 
-            if previous_address == None: 
-                first_indices = leaf.indices[self.p[leaf.indices] < 0]
-            else: 
-                previous_leaf = self.node(previous_address)
-                assert previous_leaf.left == None and previous_leaf.right == None, 'Previous node must be a leaf.'
-                first_indices = leaf.indices[np.isin(self.p[leaf.indices], previous_leaf.indices)]        
-        else:
-            # Filter samples down to those whose predecessor is *not* in this leaf.
-            first_indices = leaf.indices[np.isin(self.p[leaf.indices], leaf.indices, invert=True)]
-        prev = {}; nxt = {}
-        for first_index in first_indices:
-            # For transition before.
-            prev_index, (_, address_p) = self.locate_prev_sample(first_index)
-            # For transition after.
-            index = first_index; n = 0
-            while True:
-                index, (next_leaf, address_n) = self.locate_next_sample(index)
-                n += 1
-                if next_leaf != leaf: break
-            # NOTE: Slightly inefficient way of conditioning on next_address.
-            if next_address == False or address_n == next_address:
-                vals = (first_index, n, self.g[first_index])
-                if address_p in prev: prev[address_p].append(vals)
-                else: prev[address_p] = [vals]
-                if address_n in nxt: nxt[address_n].append(vals)
-                else: nxt[address_n] = [vals]
-        return prev, nxt
+        # Filter samples down to those whose predecessor is *not* in this leaf.
+        first_indices = leaf.indices[np.nonzero(self.nint[self.p[leaf.indices]] != nint)]
+        prev, nxt, both = {}, {}, {}
+        for index in first_indices:
+            # Get the integer for the previous leaf.
+            nint_p = self.nint[self.p[index]]
+            # Get the integer for the next leaf, and the sequence of successors up to that time.
+            next_nint, sequence = self.get_next_nint(index)
+            # Store information about this sequence with previous, next and both together.
+            info = [len(sequence), self.g[index]] # Sequence length and return from first sample.
+            if nint_p in prev: prev[nint_p].append(info)
+            else: prev[nint_p] = [info]
+            if next_nint in nxt: nxt[next_nint].append(info)
+            else: nxt[next_nint] = [info]
+            pn = (nint_p, next_nint) 
+            if pn in both: both[pn].append(info)
+            else: both[pn] = [info]
+        # Convert dictionary entries into numpy arrays.
+        prev = {k:np.array(v) for k,v in prev.items()}
+        nxt = {k:np.array(v) for k,v in nxt.items()}
+        both = {k:np.array(v) for k,v in both.items()}
+        return prev, nxt, both, len(first_indices)
 
     
-    def leaf_transition_probs(self, address, previous_address=False, next_address=False):
+    def get_leaf_transition_probs(self, nint):
         """
-        Convert the output of the leaf_transitions method into probabilities.
+        Convert the output of the get_leaf_transitions method into probabilities:
+            - Previous/next leaf marginal.
+            - Previous/next conditional (on next/previous).
         """
-        prev, nxt = self.leaf_transitions(address, previous_address, next_address)
-        probs = {}
-        # For transition before.
-        n = sum(len(tr) for tr in prev.values())
-        durations = [np.mean([i[1] for i in tr]) for tr in prev.values()]
-        returns = [np.mean([i[2] for i in tr]) for tr in prev.values()]
-        probs['prev'] = {l:(len(tr)/n, len(tr), d, g) for (l,tr), d, g in zip(prev.items(), durations, returns)}
-        # For transition after.
-        durations = [np.mean([i[1] for i in tr]) for tr in nxt.values()]
-        returns = [np.mean([i[2] for i in tr]) for tr in nxt.values()]
-        probs['next'] = {l:(len(tr)/n, len(tr), d, g) for (l,tr), d, g in zip(nxt.items(), durations, returns)}
-        return probs
+        prev, nxt, both, n = self.get_leaf_transitions(nint)
+        P = {'prev':{},'next':{}}
+        # Function for processing sequences into the right form.
+        f = lambda seqs, n : [len(seqs)/n, len(seqs)] + list(np.mean(seqs, axis=0))
+        # For marginals, normalise by total number of sequences.
+        P['prev']['marginal'] = {k:f(v, n) for k,v in prev.items()}
+        P['next']['marginal'] = {k:f(v, n) for k,v in nxt.items()}
+        # For conditionals, normalise by number of sequences matching condition.
+        for cond, (_,n,_,_) in P['next']['marginal'].items():
+            P['prev'][cond] = {k[0]:f(v, n) for k,v in both.items()
+                               if k[1] == cond} # Filter with condition.
+        for cond, (_,n,_,_) in P['prev']['marginal'].items():
+            P['next'][cond] = {k[1]:f(v, n) for k,v in both.items()
+                               if k[0] == cond} # Filter with condition.
+        return P
 
     
     def compute_all_leaf_transition_probs(self):
         """
-        Run the leaf_transition_probs method for all leaves and store.
+        Run the get_leaf_transition_probs method for all leaves and store.
         """
-        self.transition_probs = {}
-        for address in self.leaf_addresses():
-            self.transition_probs[address] = self.leaf_transition_probs(address=address)
+        self.P = {}
+        with tqdm(total=self.num_leaves) as pbar:
+            for nint in self.leaf_nints:
+                self.P[nint] = self.get_leaf_transition_probs(nint)
+                pbar.update(1)
+        
 
-
-    def path_leaf_to_leaf(self, start_address, end_address, reverse=False, cost_by='prob', triplet=False):
+    def get_paths_from_source(self, costs, source_index, 
+                              best_cost, worst_cost, higher_is_better,
+                              combine, better, p_n, conditional):
         """
-        Use a modified Dijkstra algorithm to find the best sequence of transitions between two leaves.
-        Where "best" is measured by one of several metrics.
-        Triplet argument conditions transition probabilities on previous leaf. 
+        Use a variant of the Dijkstra algorithm to find the best sequence of transitions from one leaf to all others.
+        Where "best" is currently measured by total probability.
+        Conditional argument conditions transition probabilities on previous leaf. 
         This makes for sparser data: greater chance of failure but better quality when succeeds.
-        NOTE: Assuming that transition probabilities have the Markov property.
         """
-        if cost_by == 'prob':
-            worst_cost = 0; best_cost = 1; higher_is_better = True
-            combine = lambda a, b : a * b
-            better = lambda a, b : a > b
-        else: raise Exception('Invalid cost_by.')
-        if reverse: p_n = 'prev'
-        else: p_n = 'next'
-        # Elements are [Previous leaf, total cost, immediate cost, visited?]
-        costs = {addr:[None, worst_cost, None, False] for addr in self.leaf_addresses()}
-        costs[start_address][1] = best_cost
-        depth = 0
+        costs[source_index][1] = False
+        costs[source_index][2] = best_cost
+        depth = 0; cond = 'marginal'
         while True:
             depth += 1
-            # Sort unvisited leaves by cost.
-            priority = [l for l in sorted(costs.items(), 
-                                key=lambda item: item[1][1],
-                                reverse=higher_is_better) 
-                                if l[1][3] == False]
-            address, (previous_address, cost_so_far, _, _) = priority[0]
-            # If the highest-priority leaf is the endpoint, the search is complete.
-            if address == end_address: break
+            # Sort unvisited leaves by total cost and identify the best one to visit next.
+            priority = sorted([c for c in costs if c[4] == False], key=lambda c: c[2], reverse=higher_is_better)
+            if priority == []: break # All leaves visited.
+            index, previous_index, cost_so_far, _, _ = priority[0]
+            # Check if we have reached the end of the accessible leaves.
+            if previous_index == None: break 
             # Mark the leaf as visited.
-            costs[address][3] = True
-            if triplet: 
-                # For triplet transition, condition on previous leaf.
-                if reverse: next_address = previous_address; previous_address = False
-                else: next_address = False
-                probs = self.leaf_transition_probs(address, previous_address, next_address)[p_n]
-            else: probs = self.transition_probs[address][p_n]
-            for next_address, vals in probs.items():
-                    if next_address != None:
-                        # Compute cost to this leaf.
-                        cost_to_here = combine(cost_so_far, vals[0])
-                        # If this is better than the stored one, overwrite.
-                        if better(cost_to_here, costs[next_address][1]):
-                            costs[next_address] = [address, cost_to_here, vals[0], False]
-        # Now backtrack through the costs dictionary to get the best path.
-        address = end_address; path = []; cost = best_cost
-        while address != start_address:
-            prev_address, _, immediate_cost, _ = costs[address]    
-            if prev_address == None: return False, False # If no path found.
-            if reverse: path.append((immediate_cost, address))
-            else: path.insert(0, (immediate_cost, address))
-            cost = combine(cost, immediate_cost)
-            address = prev_address
-        if reverse: path.append((None, address))
-        else: path.insert(0, (None, address))
-        return path, cost
+            costs[index][4] = True
+            # For conditional transition, condition on previous leaf.
+            if conditional and index != source_index: cond = self.leaf_nints[previous_index]
+            for next_nint, vals in self.P[self.leaf_nints[index]][p_n][cond].items():
+                if next_nint != 0:
+                    # Compute cost to this leaf.
+                    cost_to_here = combine(cost_so_far, vals[0])
+                    # If this is better than the stored one, overwrite.
+                    next_index = self.leaf_nints.index(next_nint)
+                    if better(cost_to_here, costs[next_index][2]):
+                        costs[next_index] = [next_index, index, cost_to_here, vals[0], False]
+        # Information to return is previous leaf indices, total costs and one-step costs.
+        _, prev, costs_total, costs_one_step, _ = [list(x) for x in zip(*costs)]
+        return prev, costs_total, costs_one_step
 
-
-    def path_between(self, start_addresses=False, start_features={}, start_attributes={}, 
-                           end_addresses=False, end_features={}, end_attributes={}, 
-                           reverse=False, cost_by='prob', triplet=False, try_reuse_df=True):
+    
+    def compute_paths_matrix(self, reverse=False, cost_by='prob', conditional=False):
         """
-        Use the path_leaf_to_leaf method to find a path between *any* pair of leaves matching condtions.
+        Run the get_paths_from_source method for all leaves and store.
+        """
+        # Set up some parameters for the search process.
+        if cost_by == 'prob':
+            best_cost = 1; worst_cost = 0; higher_is_better = True
+            combine = lambda a, b: a * b
+            better = lambda a, b: a > b
+        else: raise Exception(f'cost_by {cost_by} not yet implemented.')
+        if reverse: p_n = 'prev'
+        else: p_n = 'next'
+        print('Computing transition paths matrix...')
+        self.path_prev, self.path_costs_total, self.path_costs_one_step = [], [], []
+        with tqdm(total=self.num_leaves) as pbar:
+            for source_index in range(self.num_leaves):
+                # Initialise costs.
+                # Elements are [index, index of previous leaf, total cost, immediate cost, visited?]
+                # TODO: Pre-populate with places we already know how to get to.
+                costs_init = [[i, None, worst_cost, None, False] for i in range(self.num_leaves)]
+                # Run the search.
+                p, t, o = self.get_paths_from_source(costs_init, source_index, 
+                                                     best_cost, worst_cost, higher_is_better,
+                                                     combine, better, p_n, conditional)
+                self.path_prev.append(p)
+                self.path_costs_total.append(t)
+                self.path_costs_one_step.append(o)
+                pbar.update(1)
+        
+
+    def get_leaf_to_leaf_path(self, source, dest): 
+        """
+        Given a source and destination leaf, get the lowest-cost path between them.
+        """
+        source_index = self.leaf_nints.index(source)
+        dest_index = self.leaf_nints.index(dest)
+        prev = self.path_prev[source_index]
+        costs_one_step = self.path_costs_one_step[source_index]
+        # Reconstruct the path by backtracking.
+        index = dest_index; path = [(source, None)]
+        while index != source_index:
+            path.insert(1, (self.leaf_nints[index], costs_one_step[index]))
+            index = prev[index]
+            if index == None: return False, False # No path found.
+        return path, self.path_costs_total[source_index][dest_index]
+
+
+    def path_between(self, source=False, source_features={}, source_attributes={}, 
+                           dest=False, dest_features={}, dest_attributes={}, 
+                           feature_mode = 'contain', try_reuse_df=True):
+        """
+        Use the get_leaf_to_leaf_path method to find paths between pairs of leaves matching condtions.
         Conditions could be on feature or attribute values.
         Can optionally specify a single start or end leaf.
         """
         if not(try_reuse_df and self.have_df): df = self.to_dataframe()
         df = self.df.loc[self.df['kind']=='leaf'] # Only care about leaves.
-        
-        # List start addresses.
-        if start_addresses == False:
-            start_addresses = self.df_filter(df, start_features, start_attributes).index.values
-        elif type(start_addresses) == tuple: start_addresses = [start_addresses]
-        # List end addresses.
-        if end_addresses == False:
-            end_addresses = self.df_filter(df, end_features, end_attributes).index.values
-        elif type(end_addresses) == tuple: end_addresses = [end_addresses]
-
+        # List source leaf integers.
+        if source == False:
+            source = self.df_filter(df, source_features, source_attributes, mode=feature_mode).index.values
+        elif type(source) == tuple: source = [source]
+        # List destination leaf integers.
+        if dest == False:
+            dest = self.df_filter(df, dest_features, dest_attributes, mode=feature_mode).index.values
+        elif type(dest) == tuple: dest = [dest]
         # Find the best path to each leaf matching the condition.
-        paths = []; costs = []
-        with tqdm(total=len(start_addresses)*len(end_addresses)) as pbar:
-            for addr_s in start_addresses:
-                for addr_e in end_addresses:
-                    path, cost = self.path_leaf_to_leaf(addr_s, addr_e, reverse, cost_by, triplet)
+        paths = []
+        with tqdm(total=len(source)*len(dest)) as pbar:
+            for s in source:
+                for d in dest:
+                    path, cost = self.get_leaf_to_leaf_path(s, d)
                     pbar.update(1)
                     if path != False:
-                        paths.append(path); costs.append(cost)
-        return paths, costs
-
-
-    # NOTE: These two methods are currently unused.
-    def node_returns(self, node=None, address=None, action=None):
-        """
-        Given a node, find the return for each consistuent sample.
-        Optionally condition this process on a given action action.
-        """
-        if node != None: assert address == None, 'Cannot specify both.'
-        elif address != None: assert node == None, 'Cannot specify both.'; node = self.node(address)
-        else: raise ValueError('Must pass either node or address.') 
-        if action != None: 
-            assert self.classifier, 'Can only condition on action in classification mode.'
-            assert action in self.action_names, 'Action not recognised.'
-            # Filter samples down to those with the specified action.
-            indices = node.indices[self.a[node.indices]==action]
-        else: indices = node.indices
-        return self.g[indices]
-
-    
-    def node_value(self, node=None, address=None, action=None):
-        """
-        Convert the output of the node_returns method into a value by taking the mean.
-        """
-        if action == None: return node.value_mean
-        return np.mean(self.node_returns(node, address, action))
+                        paths.append((path, cost))
+        # Sort the paths by their cost and return.
+        paths.sort(key=lambda x:x[1], reverse=True)
+        return paths
 
 
 # ===================================================================================================================
@@ -874,14 +1237,15 @@ class AugDT:
         """
         assert self.tree != None, 'Must have already grown tree.'
         assert len(o) == len(a) == len(r) == len(p) == len(n), 'All inputs must be the same length.'
+        assert min(p) == min(n) >= -1, 'Episode start/end must be denoted by index of -1.'
         if self.cf == None: self.cf = counterfactual()
         # Convert actions into indices.
         if self.classifier: a = np.array([self.action_names.index(c) for c in a]) 
         # Compute return for each new sample.
-        g = self.compute_returns(r, p, n)
-        # Use the extant tree to get an address for each sample, and predict its value under the target policy.
-        R = self.predict(o, attributes=['address','value'])       
-        addresses = R['address']; v_t = R['value']
+        g = self.get_returns(r, p, n)
+        # Use the extant tree to get a leaf integer for each sample, and predict its value under the target policy.
+        R = self.predict(o, attributes=['nint','value'])       
+        nints = R['nint']; v_t = R['value']
         # Store the counterfactual data, appending if applicable.
         num_samples_prev = self.cf.num_samples
         if append == False or num_samples_prev == 0:
@@ -901,10 +1265,11 @@ class AugDT:
         # Compute regret for each new sample. 
         self.cf_compute_regret(regret_steps, num_samples_prev)
         # Store new samples at nodes by back-propagating.
-        samples_per_leaf = {addr:[] for addr in set(addresses)}
-        for index, addr in zip(np.arange(num_samples_prev, self.cf.num_samples), addresses):
-            samples_per_leaf[addr].append(index)
-        for address, indices in samples_per_leaf.items(): 
+        samples_per_leaf = {nint:[] for nint in set(nints)}
+        for index, nint in zip(np.arange(num_samples_prev, self.cf.num_samples), nints):
+            samples_per_leaf[nint].append(index)
+        for nint, indices in samples_per_leaf.items():
+            address = int_to_bits(nint) 
             self.node(address).cf_indices += indices 
             while address != ():
                 ancestor, address = self.parent(address)
@@ -923,7 +1288,7 @@ class AugDT:
         """
         assert not (start_index > 0 and steps != self.cf.regret_steps), "Can't use different values of regret_steps in an appended dataset; recompute first."
         self.cf.regret[start_index:] = np.nan
-        for index in np.argwhere(self.cf.p < 0):
+        for index in np.argwhere(self.cf.p == -1):
             if index >= start_index:
                 ep_indices, regret = self.cf_get_regret_trajectory(index[0], steps)
                 self.cf.regret[ep_indices] = regret
@@ -949,7 +1314,7 @@ class AugDT:
 
         # Compute n-step returns.
         g = self.get_returns_n_step_ordered_episode(r, p, n, steps)
-        # Compute regret = target v - (n-step return + discounted value of state in n-steps' time).
+        # Compute regret = target v - (n-step return + discounted value of sample in n-steps' time).
         v_t_future = np.pad(v_t[steps:], (0, steps), mode='constant') # Pad end of episodes.
         regret = v_t - (g + (v_t_future * (self.gamma ** steps)))
         return indices, regret
@@ -982,11 +1347,11 @@ class AugDT:
         smooth_window = (2 * crit_smoothing) + 1
         ep_obs, ep_crit, all_crit, all_timesteps = [], [], [], []
         # Split the training data into episodes and iterate through.
-        for ep, indices in enumerate(self.split_into_episodes(self.p, self.n)):
-            # Construct an observation time series for this episode.
-            ep_obs.append(self.o[indices])
+        episodes = self.split_into_episodes(self.p, self.n)
+        for ep, indices in enumerate(episodes):
             # Temporally smooth the criticality time series for this episode.
-            crit = running_mean(self.c[indices], smooth_window)
+            if crit_smoothing == 0: crit = self.c[indices]
+            else: crit = running_mean(self.c[indices], smooth_window)
             ep_crit.append(crit)
             # Store 'unravelled' criticality and timestep indices so can sort globally.
             all_crit += list(crit)
@@ -994,20 +1359,23 @@ class AugDT:
         # Sort timesteps (across all episodes) by smoothed criticality.
         all_timesteps_sorted = [t for _,t in sorted(zip(all_crit, all_timesteps))]
         # Now iterate through the sorted timesteps and construct highlights in order of criticality.
-        self.highlights_obs, self.highlights_crit, used = [], [], []
+        self.highlights_keypoint, self.highlights_indices, self.highlights_crit, used = [], [], [], set()
         if max_length != np.inf: max_length = max_length // 2
-        while all_timesteps_sorted != []:
-            # Pop the most critical timestep off all_timesteps_sorted.
-            timestep = all_timesteps_sorted.pop()
-            if timestep not in used: # If hasn't been used in a previous highlight.
-                ep, t = timestep
-                # Assemble a list of timesteps either side.
-                trajectory = np.arange(max(0, t-max_length), min(len(ep_obs[ep]), t+max_length))
-                # Store this highlight and its smoothed criticality time series.
-                self.highlights_obs.append(ep_obs[ep][trajectory])
-                self.highlights_crit.append(ep_crit[ep][trajectory])
-                # Record all these timesteps as used.
-                used += [(ep, tt) for tt in trajectory]
+        with tqdm(total=len(all_timesteps_sorted)) as pbar:
+            while all_timesteps_sorted != []:
+                # Pop the most critical timestep off all_timesteps_sorted.
+                timestep = all_timesteps_sorted.pop()
+                pbar.update(1)
+                if timestep not in used: # If hasn't been used in a previous highlight.
+                    ep, t = timestep
+                    # Assemble a list of timesteps either side.
+                    trajectory = np.arange(max(0, t-max_length), min(len(episodes[ep]), t+max_length))
+                    # Store this highlight and its smoothed criticality time series.
+                    self.highlights_keypoint.append(episodes[ep][t])
+                    self.highlights_indices.append(episodes[ep][trajectory])
+                    self.highlights_crit.append(ep_crit[ep][trajectory])
+                    # Record all these timesteps as used.
+                    used = used | {(ep, tt) for tt in trajectory}
         self.have_highlights = True 
         
         
@@ -1021,27 +1389,32 @@ class AugDT:
             # Calculate the distance between the opposite corners of the global feature lims box.
             # This is used for normalisation.
             dist_norm = minkowski_distance(self.global_feature_lims[:,0] * self.feature_scales,
-                                            self.global_feature_lims[:,1] * self.feature_scales, p=p)
-        chosen_highlights_obs, chosen_highlights_crit, i, n = [], [], -1, 0
+                                           self.global_feature_lims[:,1] * self.feature_scales, p=p)
+        chosen_highlights_keypoint, chosen_highlights_indices, chosen_highlights_crit, i, n = [], [], [], -1, 0
         while n < k: 
             i += 1
+            if i >= len(self.highlights_indices): break
             if diversity > 0 and n > 0:
                 # Find the feature-scaled Frechet distance to each existing highlight and normalise.
-                dist_to_others = np.array([scaled_frechet_dist(self.highlights_obs[i],
-                                                               chosen_highlights_obs[j],
-                                                               self.feature_scales, p=p)
+                # dist_to_others = np.array([scaled_frechet_dist(self.highlights_obs[i],
+                #                                                chosen_highlights_obs[j],
+                #                                                self.feature_scales, p=p)
+                #                            for j in range(n)]) / dist_norm 
+                dist_to_others = np.array([minkowski_distance(self.o[self.highlights_keypoint[i]] * self.feature_scales,
+                                                              self.o[chosen_highlights_keypoint[j]] * self.feature_scales, p=p)
                                            for j in range(n)]) / dist_norm                
                 
                 print(i, n, min(dist_to_others), max(dist_to_others))
                 
-                assert max(dist_to_others) <= 1, 'Error: Scaled-and-normalised Frechet distance should always be <= 1!'
+                assert max(dist_to_others) <= 1, 'Error: Scaled-and-normalised distance should always be <= 1!'
                 # Ignore this highlight if the smallest Frechet distance is below a threshold.
                 if min(dist_to_others) < diversity: continue
             # Store this highlight.
-            chosen_highlights_obs.append(self.highlights_obs[i])
+            chosen_highlights_keypoint.append(self.highlights_keypoint[i])
+            chosen_highlights_indices.append(self.highlights_indices[i])
             chosen_highlights_crit.append(self.highlights_crit[i])
             n += 1
-        return chosen_highlights_obs, chosen_highlights_crit
+        return chosen_highlights_indices, chosen_highlights_crit
 
 
 # ===================================================================================================================
@@ -1091,8 +1464,8 @@ class AugDT:
         """
         def recurse(node, partitions=[]):
             # Basic identification.
-            data['address'].append(node.address)
-            data['depth'].append(len(node.address))
+            data['nint'].append(node.nint)
+            data['depth'].append(len(int_to_bits(node.nint)))
             data['kind'].append(('internal' if node.left else 'leaf'))
             # Feature ranges.
             ranges = self.global_feature_lims.copy()
@@ -1124,6 +1497,10 @@ class AugDT:
             # Value information.
             data['value'].append(node.value_mean)
             data['value_impurity'].append(node.value_impurity)
+            # Derivative information.
+            data['derivative_impurity'].append(node.d_norm_impurity)
+            try: data['transition_impurity'].append(node.transition_impurity)
+            except: data['transition_impurity'].append(None)
             # Criticality information.
             data['criticality'].append(node.criticality_mean)
             data['criticality_impurity'].append(node.criticality_impurity)
@@ -1135,7 +1512,7 @@ class AugDT:
 
         # Set up dictionary keys.
         #    Basic identification.
-        keys = ['address','depth','kind']
+        keys = ['nint','depth','kind']
         #    Feature ranges.
         keys += [f'{f} {sign}' for f in self.feature_names for sign in ('>','<')] 
         #    Population information.
@@ -1145,6 +1522,9 @@ class AugDT:
         if self.classifier: keys += ['action_counts','weighted_action_counts']
         #    Value information.
         keys += ['value','value_impurity']
+        #    Derivative information.
+        keys += ['derivative_impurity']
+        keys += ['transition_impurity']
         #    Criticality information.
         keys += ['criticality','criticality_impurity']
         data = {k:[] for k in keys}
@@ -1154,17 +1534,17 @@ class AugDT:
         # Populate dictionary by recursion through the tree.
         recurse(self.tree)        
         # Convert into dataframe.
-        self.df = pd.DataFrame.from_dict(data).set_index('address')
+        self.df = pd.DataFrame.from_dict(data).set_index('nint')
         self.have_df = True
         # If no out file specified, just return.
         if out_file == None: return self.df
         else: self.df.to_csv(out_file+'.csv', index=False)
 
 
-    def df_filter(self, df, features={}, attributes={}):
+    def df_filter(self, df, features={}, attributes={}, mode='overlap'):
             """
-            Filter the subset of nodes that overlap with a set of feature ranges,
-            and / or have attributes within specified ranges.
+            Filter the subset of nodes that overlap with (or are entirely contained within)
+            a set of feature ranges, and / or have attributes within specified ranges.
             If using features, compute the proportion of overlap for each.
             """
             # Build query.
@@ -1172,10 +1552,14 @@ class AugDT:
             for f, r in features.items():
                 feature_ranges.append(r)
                 # Filter by features.
-                #    Determine whether two ranges overlap:
-                #    https://stackoverflow.com/questions/325933/determine-whether-two-date-ranges-overlap/325964#325964
-                query.append(f'`{f} <`>={r[0]}')
-                query.append(f'`{f} >`<={r[1]}')
+                if mode == 'overlap':
+                    # Determine whether two ranges overlap:
+                    # https://stackoverflow.com/questions/325933/determine-whether-two-date-ranges-overlap/325964#325964
+                    query.append(f'`{f} <`>={r[0]}')
+                    query.append(f'`{f} >`<={r[1]}')
+                elif mode == 'contain':
+                    query.append(f'`{f} >`>={r[0]}')
+                    query.append(f'`{f} <`<={r[1]}')
             for attr, r in attributes.items():
                 # Filter by attributes.
                 query.append(f'{attr}>={r[0]} & {attr}<={r[1]}')
@@ -1197,7 +1581,7 @@ class AugDT:
     def treemap(self, features, attributes=[None], lims=[], 
                   visualise=True, axes=[],
                   action_colours=None, cmap_percentiles=[5,95], cmap_midpoints=[], density_percentile=90,
-                  alpha_by_density=False, edge_colour=None, show_addresses=False, try_reuse_df=True):
+                  alpha_by_density=False, edge_colour=None, show_nints=False, try_reuse_df=True):
         """
         Create a treemap visualisation across one or two features, 
         possibly projecting across all others.
@@ -1216,13 +1600,15 @@ class AugDT:
                  'action_impurity':custom_cmap.reversed(),
                  'value':custom_cmap,
                  'value_impurity':custom_cmap.reversed(),
+                 'derivative_impurity':custom_cmap.reversed(),
+                 'transition_impurity':custom_cmap.reversed(),
                  'criticality':custom_cmap,
                  'criticality_impurity':custom_cmap.reversed(),
                  'sample_density':matplotlib.cm.gray,
                  'weight_density':matplotlib.cm.gray,
                  None:None
                  }
-        if type(attributes) == str: attributes = [attributes]
+        if type(attributes) == str or attributes == None: attributes = [attributes]
         n_a = len(attributes)
         for attr in attributes: 
             assert attr in cmaps, 'Invalid attribute.'
@@ -1235,71 +1621,73 @@ class AugDT:
             cmap_midpoints = [None for f in attributes]   
         if n_f < self.num_features: marginalise = True
         else: marginalise = False
-        regions = {}                  
-        if not marginalise:
-            # This is easy: can just use leaves directly.
-            if n_f == 1: height = 1
-            for address, leaf in df.iterrows():
-                xy = []; outside_lims = False
-                for i, (f, lim) in enumerate(zip(features, lims)):
-                    f_min = leaf['{} >'.format(f)]
-                    f_max = leaf['{} <'.format(f)]
-                    # Ignore if leaf is outside lims.
-                    if f_min >= lim[1] or f_max <= lim[0]: outside_lims = True; break
-                    f_min = max(f_min, lim[0])
-                    f_max = min(f_max, lim[1])
-                    xy.append(f_min)
-                    if i == 0: width = f_max - f_min 
-                    else:      height = f_max - f_min 
-                if outside_lims: continue
-                if n_f == 1: xy.append(0)
-                regions[address] = {'xy':xy, 'width':width, 'height':height, 'alpha':1}  
-                for attr in attributes_plus: 
-                    if attr != None: regions[address][attr] = leaf[attr]   
-        else:
-            # Get all unique values mentioned in partitions for these features.
-            f1 = features[0]
-            p1 = np.unique(df[[f1+' >',f1+' <']].values) # Sorted by default.
-            r1 = np.vstack((p1[:-1],p1[1:])).T # Ranges.
-            if n_f == 2: 
-                f2 = features[1]
-                p2 = np.unique(df[[f2+' >',f2+' <']].values) 
-                r2 = np.vstack((p2[:-1],p2[1:])).T
-            else: r2 = [[None,None]]
-            for m, ((min1, max1), (min2, max2)) in enumerate(tqdm(np.array([[i,j] for i in r1 for j in r2]))):
-                if min1 >= lims[0][1] or max1 <= lims[0][0]: continue # Ignore if leaf is outside lims.
-                min1 = max(min1, lims[0][0])
-                max1 = min(max1, lims[0][1])
-                width = max1 - min1
-                feature_ranges = {features[0]: [min1, max1]}
-                if n_f == 1: 
-                    xy = [min1, 0]
-                    height = 1
-                else: 
-                    if min2 >= lims[1][1] or max2 <= lims[1][0]: continue
-                    min2 = max(min2, lims[1][0])
-                    max2 = min(max2, lims[1][1])
-                    feature_ranges[features[1]] = [min2, max2]
-                    xy = [min1, min2]
-                    height = max2 - min2   
-                regions[m] = {'xy':xy, 'width':width, 'height':height, 'alpha':1}  
-                if attributes != [None]:           
-                    # Find "core": the leaves that overlap with the feature range(s).
-                    core = self.df_filter(df, features=feature_ranges)
-                    for attr in attributes_plus:
-                        if attr == None: pass
-                        elif attr == 'action' and self.classifier:
-                            # Special case for action with classification: discrete values.
-                            regions[m][attr] = np.argmax(np.dot(np.vstack(core['weighted_action_counts'].values).T, 
-                                                                        core['overlap'].values.reshape(-1,1)))
-                        else: 
-                            if attr in ('sample_density','weight_density'): normaliser = 'volume' # Another special case for densities.
-                            else:                                           normaliser = 'weight_sum'
-                            # Take contribution-weighted mean across the core.
-                            norm_sum = np.dot(core[normaliser].values, core['overlap'].values)
-                            # NOTE: Averaging process assumes uniform data distribution within leaves.
-                            core['contrib'] = core.apply(lambda row: (row[normaliser] * row['overlap']) / norm_sum, axis=1)
-                            regions[m][attr] = np.nansum(core[attr].values * core['contrib'].values)          
+        regions = {}  
+        if not (attributes == [None] and edge_colour == None):                
+            if not marginalise:
+                # This is easy: can just use leaves directly.
+                if n_f == 1: height = 1
+                for nint, leaf in df.iterrows():
+                    xy = []; outside_lims = False
+                    for i, (f, lim) in enumerate(zip(features, lims)):
+                        f_min = leaf['{} >'.format(f)]
+                        f_max = leaf['{} <'.format(f)]
+                        # Ignore if leaf is outside lims.
+                        if f_min >= lim[1] or f_max <= lim[0]: outside_lims = True; break
+                        f_min = max(f_min, lim[0])
+                        f_max = min(f_max, lim[1])
+                        xy.append(f_min)
+                        if i == 0: width = f_max - f_min 
+                        else:      height = f_max - f_min 
+                    if outside_lims: continue
+                    if n_f == 1: xy.append(0)
+                    m = nint
+                    regions[m] = {'xy':xy, 'width':width, 'height':height, 'alpha':1}  
+                    for attr in attributes_plus: 
+                        if attr != None: regions[m][attr] = leaf[attr]   
+            else:
+                # Get all unique values mentioned in partitions for these features.
+                f1 = features[0]
+                p1 = np.unique(df[[f1+' >',f1+' <']].values) # Sorted by default.
+                r1 = np.vstack((p1[:-1],p1[1:])).T # Ranges.
+                if n_f == 2: 
+                    f2 = features[1]
+                    p2 = np.unique(df[[f2+' >',f2+' <']].values) 
+                    r2 = np.vstack((p2[:-1],p2[1:])).T
+                else: r2 = [[None,None]]
+                for m, ((min1, max1), (min2, max2)) in enumerate(tqdm(np.array([[i,j] for i in r1 for j in r2]))):
+                    if min1 >= lims[0][1] or max1 <= lims[0][0]: continue # Ignore if leaf is outside lims.
+                    min1 = max(min1, lims[0][0])
+                    max1 = min(max1, lims[0][1])
+                    width = max1 - min1
+                    feature_ranges = {features[0]: [min1, max1]}
+                    if n_f == 1: 
+                        xy = [min1, 0]
+                        height = 1
+                    else: 
+                        if min2 >= lims[1][1] or max2 <= lims[1][0]: continue
+                        min2 = max(min2, lims[1][0])
+                        max2 = min(max2, lims[1][1])
+                        feature_ranges[features[1]] = [min2, max2]
+                        xy = [min1, min2]
+                        height = max2 - min2   
+                    regions[m] = {'xy':xy, 'width':width, 'height':height, 'alpha':1}  
+                    if attributes != [None]:           
+                        # Find "core": the leaves that overlap with the feature range(s).
+                        core = self.df_filter(df, features=feature_ranges)
+                        for attr in attributes_plus:
+                            if attr == None: pass
+                            elif attr == 'action' and self.classifier:
+                                # Special case for action with classification: discrete values.
+                                regions[m][attr] = np.argmax(np.dot(np.vstack(core['weighted_action_counts'].values).T, 
+                                                                            core['overlap'].values.reshape(-1,1)))
+                            else: 
+                                if attr in ('sample_density','weight_density'): normaliser = 'volume' # Another special case for densities.
+                                else:                                           normaliser = 'weight_sum'
+                                # Take contribution-weighted mean across the core.
+                                norm_sum = np.dot(core[normaliser].values, core['overlap'].values)
+                                # NOTE: Averaging process assumes uniform data distribution within leaves.
+                                core['contrib'] = core.apply(lambda row: (row[normaliser] * row['overlap']) / norm_sum, axis=1)
+                                regions[m][attr] = np.nansum(core[attr].values * core['contrib'].values)          
         if visualise:
             if n_f == 1:
                 if axes != []: ax = axes
@@ -1308,8 +1696,10 @@ class AugDT:
                 ax.set_yticks(np.arange(n_a)+0.5)
                 ax.set_yticklabels(attributes)
                 ax.set_ylim([0,max(1,n_a)])
-                ax.add_patch(matplotlib.patches.Rectangle(xy=[lims[0][0],0], width=lims[0][1]-lims[0][0], height=n_a, 
-                                           facecolor='k', hatch=None, edgecolor=None, zorder=-11))
+                if alpha_by_density:
+                    # If doing alpha_by_density, add background.
+                    ax.add_patch(matplotlib.patches.Rectangle(xy=[lims[0][0],0], width=lims[0][1]-lims[0][0], height=n_a, 
+                                            facecolor='k', hatch=None, edgecolor=None, zorder=-11))
             else:
                 offset = np.array([0,0])
             # If doing alpha_by_density, precompute alpha values.
@@ -1330,10 +1720,10 @@ class AugDT:
                     ax.set_title(attr)
                     ax.set_xlabel(features[0]); ax.set_xlim(lims[0])
                     ax.set_ylabel(features[1]); ax.set_ylim(lims[1])    
-                    # Add background.
-                    ax.add_patch(matplotlib.patches.Rectangle(xy=[lims[0][0],lims[1][0]], width=lims[0][1]-lims[0][0], height=lims[1][1]-lims[1][0], 
-                                 facecolor='k', hatch=None, edgecolor=None, zorder=-11))
-
+                    if alpha_by_density:
+                        # If doing alpha_by_density, add background.
+                        ax.add_patch(matplotlib.patches.Rectangle(xy=[lims[0][0],lims[1][0]], width=lims[0][1]-lims[0][0], height=lims[1][1]-lims[1][0], 
+                                    facecolor='k', hatch=None, edgecolor=None, zorder=-11))
                 if attr == None: pass
                 elif attr == 'action' and self.classifier:
                     assert action_colours != None, 'Specify colours for discrete actions.'
@@ -1376,8 +1766,8 @@ class AugDT:
                     ax.add_patch(matplotlib.patches.Rectangle(
                                  xy=region['xy']+offset, width=region['width'], height=region['height'], 
                                  facecolor=colour, edgecolor=edge_colour, alpha=alpha, zorder=-10))
-                    # Add leaf address.
-                    if not marginalise and show_addresses: 
+                    # Add leaf integer.
+                    if not marginalise and show_nints: 
                         ax.text(region['xy'][0]+region['width']/2, region['xy'][1]+region['height']/2, m, 
                                 horizontalalignment='center', verticalalignment='center')
             # Some quick margin adjustments.
@@ -1387,27 +1777,49 @@ class AugDT:
         return regions, axes
 
 
-    def plot_transitions_2D(self, path, features, ax=None, colour='k', alpha=1, try_reuse_df=True):
+    def plot_transitions_2D(self, path, features, tightening=1, tighten_thresh=1e-4,
+                            ax=None, colour='k', alpha=1, try_reuse_df=True):
         """
         Given a sequence of transitions between leaves, plot on the specified feature axes.
+        Optionally do iterative averaging to tighten the path rather than using leaf centroids.
         """
-        if type(features) in (str, int): features = [features]
-        if not(try_reuse_df and self.have_df): df = self.to_dataframe()
-        df = self.df.loc[self.df['kind']=='leaf'] # Only care about leaves.
-        pts = []
-        for cost, address in path:
-            leaf = df.loc[[address]]
-            pt = []
-            for f in features:
-                lims = leaf[[f+' >',f+' <']].values[0]
-                pt.append(lims[0] + ((lims[1] - lims[0]) / 2))
-            pts.append(pt)
-        return self.plot_trajectory_2D(pts, ax, colour, alpha)
+        if not(try_reuse_df and self.have_df): self.to_dataframe()
+        assert tightening >= 0 and tightening <= 1
+        n_f = len(features)
+        # List the columns to query from the dataframe.
+        cols = []
+        for f in features: cols += [f+' >']
+        for f in features: cols += [f+' <']
+        # Create a matrix containing the hyperrectangle boundaries for the leaves visited.
+        # This has shape 2 * len(path) * len(features).
+        lims = np.stack(np.split(self.df.loc[[p[0] for p in path]][cols].values, 2, axis=1))
+        # Initialise the points to plot as the centroids of the hyperrectangles.
+        centroids = np.mean(lims, axis=0)
+        pts = centroids.copy()
+        # If doing tightening, iteratively average each point.
+        if tightening > 0:
+            i = 0
+            scales = np.array([self.feature_scales[self.feature_names.index(f)] for f in features])
+            while True:
+                pts_new = pts.copy()
+                for f in range(n_f):
+                    pts_new[:,f] = np.convolve(pts_new[:,f],[0.5,0,0.5], 'full')[1:-1]
+                pts_new = np.clip(pts_new, lims[0], lims[1])
+                delta = np.max((pts_new - pts) * scales)
+                if i == 0: 
+                    if delta == 0: delta = 1 # Prevents div/0 error.
+                    delta_0 = delta
+                    
+                elif delta / delta_0 < tighten_thresh: break
+                pts = pts_new; i += 1
+            # Take the weighted average of the relaxed and centroid points.
+            pts = (pts * tightening) + (centroids * (1 - tightening))
+        return self.plot_trajectory_2D(pts, ax=ax, colour=colour, alpha=alpha)
 
 
     def plot_trajectory_2D(self, pts, features=[], ax=None, colour='k', alpha=1):
         """
-        xxx
+        Plot a trajectory of observations in a two-feature plane.
         """
         pts = np.array(pts)
         n_f = pts.shape[1]
@@ -1417,10 +1829,10 @@ class AugDT:
             # This allows plotting of a projected path onto two specified features.
             pts = pts[:,[self.feature_names.index(f) for f in features]]   
         if ax == None: _, ax = matplotlib.pyplot.subplots()
-        ax.plot(pts[:,0], pts[:,1], colour, alpha=alpha)
+        ax.plot(pts[:,0], pts[:,1], c=colour, alpha=alpha)
         ax.scatter(pts[0,0], pts[0,1], c='y', alpha=alpha, zorder=10)
         ax.scatter(pts[-1,0], pts[-1,1], c='k', alpha=alpha, zorder=10)
-        return pts
+        return pts, ax
 
 
     def cf_scatter_regret(self, features, indices=None, lims=[], ax=None):
@@ -1454,18 +1866,42 @@ class AugDT:
         return ax
 
 
+    def plot_leaf_derivatives_2D(self, features=[], ax=None, 
+                                 colour='k', lengthscale=1, linewidth=0.005, try_reuse_df=True):
+        """
+        xxx
+        """
+        if not(try_reuse_df and self.have_df): self.to_dataframe()
+        if len(features) != 2: 
+            assert self.num_features == 2; features = self.feature_names
+        # List the columns to query from the dataframe.
+        cols = []
+        for f in features: cols += [f+' >']
+        for f in features: cols += [f+' <']
+        lims = np.stack(np.split(self.df.loc[self.leaf_nints][cols].values, 2, axis=1))
+        centroids = np.mean(lims, axis=0) # Position arrows at leaf centroids.
+        # Get mean derivative for each leaf.
+        d_mean = np.array([self.node(nint).derivative_mean for nint in self.leaf_nints])
+        # Plot arrows.
+        if ax == None: _, ax = matplotlib.pyplot.subplots()
+        matplotlib.pyplot.quiver(centroids[:,0], centroids[:,1], d_mean[:,0], d_mean[:,1], 
+                                 pivot='mid', angles='xy', scale_units='xy', units='xy', 
+                                 color=colour, scale=1/lengthscale, width=linewidth, minshaft=1)
+        return ax
+
+
 # ===================================================================================================================
 # NODE CLASS.
 
 
 class Node():
     def __init__(self, 
-                 address, 
+                 nint, 
                  num_samples, 
                  indices, 
                  ):
         # These are the basic attributes; more are added elsewhere.
-        self.address = address
+        self.nint = nint
         self.indices = indices
         self.num_samples = num_samples
         self.left = None
@@ -1521,6 +1957,16 @@ import scipy.ndimage.filters as ndif
 def running_mean(x, N):
     x = np.pad(x, N // 2, mode='constant', constant_values=(x[0],x[-1]))
     return ndif.uniform_filter1d(x, N, mode='constant', origin=-(N//2))[:-(N-1)]
+
+# Convert sequence of bits (e.g. leaf address) to an integer.
+# NOTE: Need to prepend a "1" to disambiguate between 00000 and 000.
+def bits_to_int(bits):
+    out = 0
+    for bit in [1] + list(bits): out = (out << 1) | bit
+    return out
+
+# Convert the other way.
+def int_to_bits(integer): return tuple(int(i) for i in bin(integer)[3:])
 
 # Frechet distance computation with scaled dimensions.
 # Slightly changed from https://github.com/cjekel/similarity_measures/blob/master/similaritymeasures/similaritymeasures.py.
